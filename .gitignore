@@ -1,0 +1,17 @@
+# 本機連線設定（含真實 IP 與 SSH 帳號）
+scripts/config.bat
+
+# Python
+__pycache__/
+*.py[cod]
+
+# 本機備份
+*.bak
+*.bak[0-9]
+app/*.bak*
+
+# 模型權重與輸出
+*.safetensors
+*.png
+*.jpg
+outputs/

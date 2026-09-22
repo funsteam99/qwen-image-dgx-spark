@@ -1,0 +1,26 @@
+version: '3.8'
+
+services:
+  qwen-comfyui:
+    image: qwen-image-studio:latest
+    container_name: qwen-image-comfyui
+    restart: always
+    ipc: host
+    network_mode: host
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    volumes:
+      - ${COMFYUI_HOST_PATH:-/home/youruser/qwen-image/ComfyUI}:/workspace/ComfyUI
+    working_dir: /workspace/ComfyUI
+    environment:
+      # GB10 統一記憶體：禁止 PyTorch allocator 囤積頁面 (Triplany/comfyui-dgx-spark)
+      - PYTORCH_NO_CUDA_MEMORY_CACHING=1
+    # --disable-mmap: DGX Spark 上 safetensors 經 mmap 會在 RAM 留一份、再複製到「VRAM」(也是 RAM)，
+    #   造成權重雙倍佔用，128GB 實際只能當 64GB 用。
+    # --disable-pinned-memory: 統一記憶體下 pinned memory 無益處。
+    command: python3 main.py --listen 0.0.0.0 --port 8188 --highvram --disable-mmap --disable-pinned-memory
