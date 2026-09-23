@@ -36,17 +36,45 @@ PE_HOST = "127.0.0.1:8200"   # 官方 Prompt Enhancer 常駐服務 (pe/pe_server
 # 實測 t2i 28.2s / edit 17.6s，皆 parse_ok=True，且零額外記憶體與磁碟。
 # 官方 PE 模型走 transformers batch-1，同樣任務需 144~160s，另需 19GB 常駐。
 # 官方雖警告非微調模型未必穩定遵守輸出格式，故保留其為可選後端。
-LLM_HOST = os.environ.get("LLM_HOST", "127.0.0.1:8006")
-LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.8")
+# 兩個本機 LLM 端點，能力不同：
+#   8002  Qwen3.6-35B GGUF (llama.cpp)  純文字，無 mmproj —— 送圖會回 HTTP 500
+#         文生圖改寫實測 8.2 秒
+#   8006  qwen3.8-27B-NVFP4 (vLLM)      具視覺能力，文生圖約 22~31 秒、改圖約 17.6 秒
+# 故依任務分流：文生圖走 8002 取其速度，改圖必須走 8006。
+LLM_ENDPOINTS = {
+    "8002": {"host": os.environ.get("LLM_HOST_TEXT", "127.0.0.1:8002"),
+             "model": os.environ.get("LLM_MODEL_TEXT",
+                                     "Qwen3.6-35B-A3B-abliterated.i1-Q4_K_M.gguf"),
+             "vision": False, "label": "8002 Qwen3.6 (純文字, 最快)"},
+    "8006": {"host": os.environ.get("LLM_HOST_VL", "127.0.0.1:8006"),
+             "model": os.environ.get("LLM_MODEL_VL", "qwen3.8"),
+             "vision": True, "label": "8006 qwen3.8 (具視覺)"},
+}
 PE_SYSTEM_PROMPTS = {
     "t2i": "/workspace/ComfyUI/pe/prompts/system_prompt_t2i.txt",
     "edit": "/workspace/ComfyUI/pe/prompts/system_prompt_edit.txt",
 }
+# 官方 PE 模型的呼叫路徑 (call_pe / pe_server.py) 保留於程式中，
+# 但不列入選單：實測本機端點快 8~10 倍且零額外資源，PE 服務已停用。
 PE_BACKENDS = {
-    "⚡ 本機 LLM (qwen3.8, 約 20 秒)": "llm",
-    "🎯 官方 PE 模型 (約 150 秒 + 切換 95 秒)": "pe",
+    "⚡ 自動 (文生圖用 8002，改圖用 8006)": "auto",
+    "8002 Qwen3.6 (純文字, 最快)": "8002",
+    "8006 qwen3.8 (具視覺)": "8006",
 }
-DEFAULT_PE_BACKEND = "⚡ 本機 LLM (qwen3.8, 約 20 秒)"
+DEFAULT_PE_BACKEND = "⚡ 自動 (文生圖用 8002，改圖用 8006)"
+
+
+def pick_endpoint(backend, task):
+    """依後端選擇與任務決定端點。回傳 (key, config, 錯誤訊息)。"""
+    need_vision = (task == "edit")
+    if backend == "auto":
+        key = "8006" if need_vision else "8002"
+        return key, LLM_ENDPOINTS[key], None
+    cfg = LLM_ENDPOINTS[backend]
+    if need_vision and not cfg["vision"]:
+        return backend, cfg, (
+            f"⚠️ {cfg['label']} 不支援影像輸入，改圖模式請改選 8006 或「⚡ 自動」。")
+    return backend, cfg, None
 
 # 官方 PE 回傳的 wh_ratio -> 本 UI 尺寸選項
 PE_RATIO_TO_CHOICE = {
@@ -72,7 +100,7 @@ def _read_system_prompt(task):
         return f.read()
 
 
-def call_llm(task, user_prompt, pil_images=None, timeout=600):
+def call_llm(task, user_prompt, pil_images=None, endpoint=None, timeout=600):
     """用本機 vLLM 服務改寫，套用官方 system prompt 與官方的解析規則。
 
     enable_thinking 必須關閉：開啟時輸出常被 max_tokens 截斷在 thinking 階段，
@@ -82,17 +110,21 @@ def call_llm(task, user_prompt, pil_images=None, timeout=600):
                 "image_url": {"url": "data:image/png;base64," + pil_to_b64(im)}}
                for im in (pil_images or [])]
     content.append({"type": "text", "text": user_prompt})
+    endpoint = endpoint or LLM_ENDPOINTS["8006"]
     body = {
-        "model": LLM_MODEL,
+        "model": endpoint["model"],
         "messages": [{"role": "system", "content": _read_system_prompt(task)},
                      {"role": "user", "content": content}],
         "max_tokens": 8192,
         "temperature": 1.0,
         "top_p": 0.95,
+        # 官方 pe_core profile：t2i 用 1.5、edit 用 0.0。
+        # 漏掉此值時 8002 的輸出長度在 724~1479 字元間大幅浮動；補上後穩定於 1600 上下。
+        "presence_penalty": 1.5 if task == "t2i" else 0.0,
         "chat_template_kwargs": {"enable_thinking": False},
     }
     req = urllib.request.Request(
-        f"http://{LLM_HOST}/v1/chat/completions",
+        f"http://{endpoint['host']}/v1/chat/completions",
         data=json.dumps(body).encode("utf-8"),
         headers={"Content-Type": "application/json"})
     t0 = time.time()
@@ -1144,12 +1176,17 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             if not imgs:
                 return gr.update(), gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
 
-        backend = PE_BACKENDS.get(backend_label, "llm")
+        backend = PE_BACKENDS.get(backend_label, "auto")
+        endpoint = None
+        if backend != "pe":
+            _key, endpoint, warn = pick_endpoint(backend, task)
+            if warn:
+                return gr.update(), gr.update(), gr.update(), warn
         try:
-            if backend == "llm":
-                r = call_llm(task, p_text, imgs)
-            else:
+            if backend == "pe":
                 r = call_pe(task, p_text, imgs, sd)
+            else:
+                r = call_llm(task, p_text, imgs, endpoint=endpoint)
         except urllib.error.HTTPError as e:
             try:
                 msg = json.loads(e.read().decode("utf-8")).get("error", str(e))
@@ -1157,7 +1194,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 msg = str(e)
             return gr.update(), gr.update(), gr.update(), f"❌ 改寫服務錯誤（{backend}）：{msg}"
         except Exception as e:
-            host = LLM_HOST if backend == "llm" else PE_HOST
+            host = PE_HOST if backend == "pe" else endpoint["host"]
             return gr.update(), gr.update(), gr.update(), (
                 f"❌ 無法連線改寫服務 ({host})：{type(e).__name__}: {e}")
 
@@ -1176,7 +1213,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             note = f"｜沿用 {follow} 的比例" if follow else (f"｜建議 {ratio}" if ratio else "")
 
         flag = "✅" if ok else "⚠️ 未解析出 JSON（已回填原始輸出）"
-        engine = "本機 LLM" if backend == "llm" else "官方 PE"
+        engine = "官方 PE" if backend == "pe" else endpoint["label"]
         return new_prompt, ratio_update, p_text, (
             f"{flag} {engine} 改寫完成（{task}，{r.get('elapsed')}s）{note}")
 

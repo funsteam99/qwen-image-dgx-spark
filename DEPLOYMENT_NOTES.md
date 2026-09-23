@@ -657,3 +657,39 @@ docker exec -d qwen-image-comfyui sh -c   'cd /workspace/ComfyUI/pe && python3 p
 ### 13.4 磁碟上的 36GB PE checkpoint 暫不刪除
 本機 LLM 切換僅一日，樣本不足；官方亦警告非微調模型未必穩定遵守輸出格式。
 待累積使用、確認未出現 `parse_ok: false` 後再回收。磁碟尚有 61 GB，不急。
+
+---
+
+## 14. 【2026-09-23】改寫引擎雙端點分流，與遺漏的 presence_penalty
+
+### 14.1 兩個本機端點，能力不同
+| 端點 | 模型 | 視覺 | 文生圖改寫 | 備註 |
+| :--- | :--- | :---: | ---: | :--- |
+| **8002** | `Qwen3.6-35B-A3B-abliterated.i1-Q4_K_M.gguf`（llama.cpp） | ❌ | **約 5 秒** | 無 mmproj，送圖回 `HTTP 500: image input is not supported` |
+| **8006** | `qwen3.8-27B-NVFP4`（vLLM） | ✅ | 22~31 秒 | 改圖改寫 17.6 秒 |
+
+注意 8002 **並非**先前已停止的 `qwen3.6-nvfp4` 容器，是另一個 llama.cpp 服務，
+且其 `/v1/models` 回傳 `{"models": [...]}` 而非 OpenAI 標準的 `{"data": [...]}`。
+
+### 14.2 分流設計
+`pick_endpoint(backend, task)` 依任務選擇端點，選單三項：
+- `⚡ 自動`（預設）：文生圖 → 8002 取其速度；改圖／多圖 → 8006（唯一具視覺能力者）
+- `8002` / `8006`：手動指定。選 8002 而任務需要視覺時，回傳明確提示而非送出去踩 500。
+
+官方 PE 模型不列入選單（`call_pe` 與 `pe_server.py` 保留於程式中備用）。
+
+### 14.3 遺漏的 presence_penalty
+`call_llm()` 初版未帶 `presence_penalty`，而官方 `pe_core` profile 明定
+**t2i 為 1.5、edit 為 0.0**。後果是輸出長度大幅不穩：
+
+| 設定 | 耗時 | 擴寫長度 |
+| :--- | ---: | ---: |
+| 未帶（連測三次） | 2.3~4.4 s | **724 / 1073 / 1479** |
+| 未關 thinking | 98.0 s | 3067 |
+| **補上 1.5** | 5.3 s | **1625（穩定）** |
+
+前端實測曾出現僅 103 字元的一句話擴寫，`finish_reason` 為 `stop`（非截斷），
+即模型自行提前收尾。補上後問題消失。
+
+**教訓**：改用非官方推論後端時，官方的**取樣參數**與 system prompt 同等重要，
+不可只搬 prompt。
