@@ -111,9 +111,20 @@ def call_llm(task, user_prompt, pil_images=None, endpoint=None, timeout=600):
                for im in (pil_images or [])]
     content.append({"type": "text", "text": user_prompt})
     endpoint = endpoint or LLM_ENDPOINTS["8006"]
+    # 8002 (Qwen3.6 GGUF) 實測若只靠 system_prompt_*.txt 約束，
+    # 輸出語言與格式會不穩定：時而中文、時而混雜，時而整包 JSON 原樣洩漏到 rewritten_prompt 之外。
+    # 故在 system prompt 後方追加強制規則，覆寫模型自由發揮的空間。
+    system_text = (
+        _read_system_prompt(task)
+        + "\n\nIMPORTANT OUTPUT RULES (override anything above if conflicting):\n"
+        "1. Output EXACTLY one JSON object and nothing else — no markdown code "
+        "fences, no explanation before or after, no extra JSON objects.\n"
+        "2. The value of \"rewritten_prompt\" MUST be written entirely in English, "
+        "regardless of what language the user's input prompt is in.\n"
+    )
     body = {
         "model": endpoint["model"],
-        "messages": [{"role": "system", "content": _read_system_prompt(task)},
+        "messages": [{"role": "system", "content": system_text},
                      {"role": "user", "content": content}],
         "max_tokens": 8192,
         "temperature": 1.0,
@@ -141,6 +152,8 @@ def _parse_pe_answer(answer, task):
     """比照官方 pe_core.parse_answer：由後往前找最後一個合法 JSON 物件。"""
     import re
     answer = (answer or "").strip()
+    # 有時模型會用 ```json ... ``` 包住輸出，先拆掉圍籬避免干擾大括號配對
+    answer = re.sub(r"^```(?:json)?\s*|\s*```$", "", answer, flags=re.MULTILINE).strip()
     spans = []
     depth = start = 0
     for i, ch in enumerate(answer):
@@ -948,12 +961,19 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                     show_label=True
                 )
 
+            orig_prompt_display = gr.Textbox(
+                label="🔒 原始提示詞（改寫前，唯讀）",
+                placeholder="按下方「Prompt 改寫」後，改寫前的原始輸入會顯示於此，供對照",
+                lines=2,
+                interactive=False
+            )
+
             prompt = gr.Textbox(
                 label="✏️ 修改指令 / 提示詞 (Prompt - 建議依官方規範使用 <image1>, <image2> 錨定)",
                 placeholder="例如：A high-fashion full-body portrait of the model from <image1>, wearing clothing from <image2>...",
                 lines=3
             )
-            
+
             with gr.Row():
                 btn_pe = gr.Button("✨ Prompt 改寫", variant="secondary", size="lg")
                 pe_backend = gr.Dropdown(
@@ -1157,7 +1177,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
     def enhance_prompt(m, p_text, editor_data, refs, sd, backend_label):
         """官方 Prompt Enhancer：短 prompt -> 擴寫 prompt，並套用官方建議畫布比例。"""
         if not (p_text or "").strip():
-            return gr.update(), gr.update(), gr.update(), "⚠️ 請先輸入提示詞再改寫。"
+            return gr.update(), gr.update(), gr.update(), gr.update(), "⚠️ 請先輸入提示詞再改寫。"
 
         refs = refs or []
         if m == MODE_T2I:
@@ -1174,14 +1194,14 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 imgs.append(main_img)
             imgs.extend(refs)
             if not imgs:
-                return gr.update(), gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
+                return gr.update(), gr.update(), gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
 
         backend = PE_BACKENDS.get(backend_label, "auto")
         endpoint = None
         if backend != "pe":
             _key, endpoint, warn = pick_endpoint(backend, task)
             if warn:
-                return gr.update(), gr.update(), gr.update(), warn
+                return gr.update(), gr.update(), gr.update(), gr.update(), warn
         try:
             if backend == "pe":
                 r = call_pe(task, p_text, imgs, sd)
@@ -1192,10 +1212,10 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 msg = json.loads(e.read().decode("utf-8")).get("error", str(e))
             except Exception:
                 msg = str(e)
-            return gr.update(), gr.update(), gr.update(), f"❌ 改寫服務錯誤（{backend}）：{msg}"
+            return gr.update(), gr.update(), gr.update(), gr.update(), f"❌ 改寫服務錯誤（{backend}）：{msg}"
         except Exception as e:
             host = PE_HOST if backend == "pe" else endpoint["host"]
-            return gr.update(), gr.update(), gr.update(), (
+            return gr.update(), gr.update(), gr.update(), gr.update(), (
                 f"❌ 無法連線改寫服務 ({host})：{type(e).__name__}: {e}")
 
         new_prompt = r.get("positive_prompt", "")
@@ -1212,15 +1232,22 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
         elif task == "edit":
             note = f"｜沿用 {follow} 的比例" if follow else (f"｜建議 {ratio}" if ratio else "")
 
-        flag = "✅" if ok else "⚠️ 未解析出 JSON（已回填原始輸出）"
         engine = "官方 PE" if backend == "pe" else endpoint["label"]
-        return new_prompt, ratio_update, p_text, (
-            f"{flag} {engine} 改寫完成（{task}，{r.get('elapsed')}s）{note}")
+        if not ok:
+            # 解析失敗時原始輸出可能混雜語言或殘留 JSON 片段，不可污染提示詞欄位，
+            # 保留使用者輸入的原始提示詞，並把可疑輸出留在狀態列供排查。
+            preview = new_prompt.replace("\n", " ")[:200]
+            flag = "⚠️ 未解析出 JSON，已保留原始提示詞未改寫"
+            return gr.update(), ratio_update, p_text, p_text, (
+                f"{flag}｜{engine}（{task}，{r.get('elapsed')}s）{note}｜原始輸出：{preview}")
+
+        return new_prompt, ratio_update, p_text, p_text, (
+            f"✅ {engine} 改寫完成（{task}，{r.get('elapsed')}s）{note}")
 
     btn_pe.click(
         fn=enhance_prompt,
         inputs=[mode, prompt, editor_input, ref_images_state, seed, pe_backend],
-        outputs=[prompt, aspect_ratio, orig_prompt_state, pe_status]
+        outputs=[prompt, aspect_ratio, orig_prompt_state, orig_prompt_display, pe_status]
     )
 
     btn_hist.click(fn=build_history_html, inputs=[hist_limit],
