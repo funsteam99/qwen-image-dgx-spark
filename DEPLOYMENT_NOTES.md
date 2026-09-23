@@ -604,3 +604,56 @@ ComfyUI 的流水號從 `00001` 重新開始，同一檔名被使用兩次。**
 ### 12.6 已知小瑕疵
 回填紀錄使用主機本地時間，新紀錄使用容器內 UTC，兩者有時差。
 不影響排序正確性，尚未統一。
+
+---
+
+## 13. 【2026-09-23】社群做法調查，與資源配置定案
+
+### 13.1 網路上其他人怎麼做擴寫
+官方建議用自家的 PE 模型，但社群實際上分三派：
+
+| 做法 | 代表專案 | 記憶體 | 對齊官方 |
+| :--- | :--- | ---: | :--- |
+| 跑官方 PE checkpoint | [benjiyaya/ComfyUI-Qwen-Image-2.1-Prompt-Enhancer](https://github.com/benjiyaya/ComfyUI-Qwen-Image-2.1-Prompt-Enhancer) | ~20 GB (bf16) / ~10 GB (int8) | 完全 |
+| 改用通用 Qwen LLM | [lihaoyun6/ComfyUI-QwenPromptRewriter](https://github.com/lihaoyun6/ComfyUI-QwenPromptRewriter) | 0（雲端 API） | 自訂 prompt |
+| 泛用本機 LLM 節點 | [EricRollei/Local_LLM_Prompt_Enhancer](https://github.com/EricRollei/Local_LLM_Prompt_Enhancer)、[BigStationW/ComfyUI-Prompt-Rewriter](https://github.com/BigStationW/ComfyUI-Prompt-Rewriter/) | 視模型 | 不綁定 |
+| **本部署：本機 vLLM + 官方 system prompt** | — | **0** | prompt 完全對齊，模型不同 |
+
+兩個有價值的發現：
+- 社群有提供**官方 PE 的 int8 量化版**（`qwen3.5_9b_qwen_image_2.1_pe_*.int8_convrot.safetensors`，
+  各 9.47 GB），比我們下載的 bf16 原版（18 GB）小一半。若日後要回頭用官方 PE，應改用此版。
+- benjiyaya 明載「VRAM: ~20GB for the PE model in bfloat16. A 24GB GPU is comfortable」——
+  印證 §9.5 遇到的記憶體壓力並非本機個案。
+- lihaoyun6 的做法與本部署同構（通用 Qwen LLM 擔任改寫器），但走阿里雲 API 且未公開其
+  system prompt；本部署直接使用官方 repo 的 `system_prompt_t2i.txt` / `system_prompt_edit.txt`
+  原檔，對齊程度更高。
+
+### 13.2 三種「int8」不可混淆
+| 對象 | 實際使用 |
+| :--- | :--- |
+| 影像模型（UNet + text encoder） | **int8_convrot**（§8 實測全勝） |
+| 擴寫引擎 | **本機 8006 `qwen3.8-27B-NVFP4`** — 與 int8 無關 |
+| 官方 PE checkpoint | **bf16 18GB × 2，閒置** |
+
+### 13.3 PE 服務停用
+改寫預設走 8006 之後，PE 服務屬於純閒置卻仍常駐 19GB。已停止：
+
+| | 停止前 | 停止後 |
+| :--- | ---: | ---: |
+| 已用記憶體 | 82 GB | **63 GB** |
+| 可用 | 38 GB | **58 GB** |
+
+停止後實測改寫仍正常（22.3 秒，輸出含合格 `rewritten_prompt`）。
+
+**PE 服務並未寫入任何自動啟動設定**（原本就是以 `docker exec -d` 手動啟動），
+因此 ComfyUI 容器重啟後不會自行回來 —— 這是刻意的。需要時手動啟動：
+
+```bash
+docker exec -d qwen-image-comfyui sh -c   'cd /workspace/ComfyUI/pe && python3 pe_server.py > /workspace/ComfyUI/pe/pe_server.log 2>&1'
+```
+
+未啟動時於 WebUI 選「🎯 官方 PE 模型」會顯示明確的連線錯誤，不會靜默失敗。
+
+### 13.4 磁碟上的 36GB PE checkpoint 暫不刪除
+本機 LLM 切換僅一日，樣本不足；官方亦警告非微調模型未必穩定遵守輸出格式。
+待累積使用、確認未出現 `parse_ok: false` 後再回收。磁碟尚有 61 GB，不急。
