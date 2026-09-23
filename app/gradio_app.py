@@ -31,6 +31,23 @@ WEIGHT_PRESETS = {
 DEFAULT_PRECISION = "int8 (官方模板預設，快且省記憶體)"
 PE_HOST = "127.0.0.1:8200"   # 官方 Prompt Enhancer 常駐服務 (pe/pe_server.py)
 
+# --- Prompt 改寫後端 ---------------------------------------------------------
+# 本機已有的 vLLM 服務 (qwen3.8-27B，具視覺能力) 可直接擔任改寫器：
+# 實測 t2i 28.2s / edit 17.6s，皆 parse_ok=True，且零額外記憶體與磁碟。
+# 官方 PE 模型走 transformers batch-1，同樣任務需 144~160s，另需 19GB 常駐。
+# 官方雖警告非微調模型未必穩定遵守輸出格式，故保留其為可選後端。
+LLM_HOST = os.environ.get("LLM_HOST", "127.0.0.1:8006")
+LLM_MODEL = os.environ.get("LLM_MODEL", "qwen3.8")
+PE_SYSTEM_PROMPTS = {
+    "t2i": "/workspace/ComfyUI/pe/prompts/system_prompt_t2i.txt",
+    "edit": "/workspace/ComfyUI/pe/prompts/system_prompt_edit.txt",
+}
+PE_BACKENDS = {
+    "⚡ 本機 LLM (qwen3.8, 約 20 秒)": "llm",
+    "🎯 官方 PE 模型 (約 150 秒 + 切換 95 秒)": "pe",
+}
+DEFAULT_PE_BACKEND = "⚡ 本機 LLM (qwen3.8, 約 20 秒)"
+
 # 官方 PE 回傳的 wh_ratio -> 本 UI 尺寸選項
 PE_RATIO_TO_CHOICE = {
     "1:1": "1:1 (2048x2048) 官方預設",
@@ -48,6 +65,77 @@ def pil_to_b64(pil_img):
     buf = io.BytesIO()
     pil_img.convert("RGB").save(buf, format="PNG")
     return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _read_system_prompt(task):
+    with open(PE_SYSTEM_PROMPTS[task], encoding="utf-8") as f:
+        return f.read()
+
+
+def call_llm(task, user_prompt, pil_images=None, timeout=600):
+    """用本機 vLLM 服務改寫，套用官方 system prompt 與官方的解析規則。
+
+    enable_thinking 必須關閉：開啟時輸出常被 max_tokens 截斷在 thinking 階段，
+    回傳空的 content（實測 259 秒且完全無輸出）。
+    """
+    content = [{"type": "image_url",
+                "image_url": {"url": "data:image/png;base64," + pil_to_b64(im)}}
+               for im in (pil_images or [])]
+    content.append({"type": "text", "text": user_prompt})
+    body = {
+        "model": LLM_MODEL,
+        "messages": [{"role": "system", "content": _read_system_prompt(task)},
+                     {"role": "user", "content": content}],
+        "max_tokens": 8192,
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "chat_template_kwargs": {"enable_thinking": False},
+    }
+    req = urllib.request.Request(
+        f"http://{LLM_HOST}/v1/chat/completions",
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json"})
+    t0 = time.time()
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = json.loads(resp.read().decode("utf-8"))
+    text = (data["choices"][0]["message"].get("content") or "")
+    parsed = _parse_pe_answer(text, task)
+    parsed["elapsed"] = round(time.time() - t0, 1)
+    parsed["thinking_chars"] = 0
+    return parsed
+
+
+def _parse_pe_answer(answer, task):
+    """比照官方 pe_core.parse_answer：由後往前找最後一個合法 JSON 物件。"""
+    import re
+    answer = (answer or "").strip()
+    spans = []
+    depth = start = 0
+    for i, ch in enumerate(answer):
+        if ch == "{":
+            if depth == 0:
+                start = i
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                spans.append(answer[start:i + 1])
+    for cand in reversed(spans):
+        try:
+            obj = json.loads(cand)
+        except Exception:
+            continue
+        if not isinstance(obj, dict):
+            continue
+        rewritten = obj.get("rewritten_prompt") or obj.get("rewrited_prompt")
+        if isinstance(rewritten, str) and rewritten.strip():
+            return {"positive_prompt": rewritten.strip(),
+                    "wh_ratio": str(obj.get("wh_ratio") or "").strip(),
+                    "ratio_follow": (str(obj.get("ratio_follow") or "").strip()
+                                     if task == "edit" else ""),
+                    "parse_ok": True}
+    return {"positive_prompt": answer, "wh_ratio": "", "ratio_follow": "",
+            "parse_ok": False}
 
 
 def call_pe(task, user_prompt, pil_images=None, seed=42, timeout=900):
@@ -732,8 +820,14 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             )
             
             with gr.Row():
-                btn_pe = gr.Button("✨ 官方 Prompt 改寫 (PE)", variant="secondary", size="lg")
-                pe_status = gr.Markdown("")
+                btn_pe = gr.Button("✨ Prompt 改寫", variant="secondary", size="lg")
+                pe_backend = gr.Dropdown(
+                    choices=list(PE_BACKENDS.keys()),
+                    value=DEFAULT_PE_BACKEND,
+                    label="改寫引擎",
+                    scale=2
+                )
+            pe_status = gr.Markdown("")
 
             with gr.Accordion("💡 官方 GitHub 標準提示詞範本 (一鍵填入)", open=False):
                 gr.Markdown("*遵循官方 `system_prompt_edit.txt` 規範：使用 `<imageX>` 明確指定主體與部件，並加入光影與細節保持約束。*")
@@ -753,44 +847,45 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             run_btn = gr.Button("🚀 開始執行生成 / 替換 (Execute)", variant="primary", size="lg")
 
         with gr.Column(scale=4):
-            # ⚠️ 必須保持展開：Gradio 6 的折疊 Accordion 不渲染子元件，
-            # 提交時會送出預設值而非畫面上的值（實測 seed 顯示官方值、送出卻是 -1）。
-            # 這些控制項是 run_btn 的 inputs，run_btn 在本區塊之外，故不可折疊。
-            with gr.Accordion("⚙️ 生成參數設定 (2K / 40 步 / CFG 1.0 / int8，已對齊官方)", open=True):
-                aspect_ratio = gr.Dropdown(
-                    choices=[
-                        "1:1 (2048x2048) 官方預設",
-                        "4:3 (2400x1792)",
-                        "3:4 (1792x2400)",
-                        "3:2 (2528x1696)",
-                        "2:3 (1696x2528)",
-                        "16:9 (2752x1536) 全景",
-                        "9:16 (1536x2752)",
-                        "1:1 省時 (1024x1024)"
-                    ],
-                    value="1:1 (2048x2048) 官方預設",
-                    label="文生圖尺寸 (官方 README aspect_ratios；以圖改圖時自動繼承原圖尺寸)"
-                )
-                precision = gr.Dropdown(
-                    choices=list(WEIGHT_PRESETS.keys()),
-                    value=DEFAULT_PRECISION,
-                    label="⚙️ 權重精度",
-                    info="切換精度會觸發模型重新載入（int8 約 18 秒、bf16 約 99 秒）"
-                )
-                steps = gr.Slider(minimum=15, maximum=50, value=40, step=1, label="推論步數 (官方 README: num_inference_steps=40)")
-                cfg = gr.Slider(
-                    minimum=1.0, maximum=5.0, value=1.0, step=0.1,
-                    label="提示詞引導強度 (CFG)",
-                    info="【官方標準：1.0】Diffusers 與官方 ComfyUI 預設值。設為 1.0 時無負向引導干擾。"
-                )
-                seed = gr.Number(value=-1, label="隨機種子 (Seed, -1 為隨機)", precision=0)
-            
             output_img = gr.Image(
                 label="🖼️ 輸出結果 (新圖像)",
                 type="pil",
                 image_mode="RGBA",
                 elem_classes=["output-checkerboard"]
             )
+
+    # 生成參數置於頁面最下方：平時不佔版面，需要時捲到底調整。
+    # ⚠️ 必須保持展開：Gradio 6 的折疊 Accordion 不渲染子元件，
+    # 提交時會送出預設值而非畫面上的值（實測 seed 顯示官方值、送出卻是 -1）。
+    # 這些控制項是 run_btn 的 inputs，故不可折疊。
+    with gr.Accordion("⚙️ 生成參數設定 (2K / 40 步 / CFG 1.0 / int8，已對齊官方)", open=True):
+        aspect_ratio = gr.Dropdown(
+            choices=[
+                "1:1 (2048x2048) 官方預設",
+                "4:3 (2400x1792)",
+                "3:4 (1792x2400)",
+                "3:2 (2528x1696)",
+                "2:3 (1696x2528)",
+                "16:9 (2752x1536) 全景",
+                "9:16 (1536x2752)",
+                "1:1 省時 (1024x1024)"
+            ],
+            value="1:1 (2048x2048) 官方預設",
+            label="文生圖尺寸 (官方 README aspect_ratios；以圖改圖時自動繼承原圖尺寸)"
+        )
+        precision = gr.Dropdown(
+            choices=list(WEIGHT_PRESETS.keys()),
+            value=DEFAULT_PRECISION,
+            label="⚙️ 權重精度",
+            info="切換精度會觸發模型重新載入（int8 約 18 秒、bf16 約 99 秒）"
+        )
+        steps = gr.Slider(minimum=15, maximum=50, value=40, step=1, label="推論步數 (官方 README: num_inference_steps=40)")
+        cfg = gr.Slider(
+            minimum=1.0, maximum=5.0, value=1.0, step=0.1,
+            label="提示詞引導強度 (CFG)",
+            info="【官方標準：1.0】Diffusers 與官方 ComfyUI 預設值。設為 1.0 時無負向引導干擾。"
+        )
+        seed = gr.Number(value=-1, label="隨機種子 (Seed, -1 為隨機)", precision=0)
 
     # --- 參考圖動態管理邏輯 ---
     def add_single_ref(new_img, current_list):
@@ -918,7 +1013,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             queue=False
         )
 
-    def enhance_prompt(m, p_text, editor_data, refs, sd):
+    def enhance_prompt(m, p_text, editor_data, refs, sd, backend_label):
         """官方 Prompt Enhancer：短 prompt -> 擴寫 prompt，並套用官方建議畫布比例。"""
         if not (p_text or "").strip():
             return gr.update(), gr.update(), "⚠️ 請先輸入提示詞再改寫。"
@@ -940,17 +1035,22 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             if not imgs:
                 return gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
 
+        backend = PE_BACKENDS.get(backend_label, "llm")
         try:
-            r = call_pe(task, p_text, imgs, sd)
+            if backend == "llm":
+                r = call_llm(task, p_text, imgs)
+            else:
+                r = call_pe(task, p_text, imgs, sd)
         except urllib.error.HTTPError as e:
             try:
                 msg = json.loads(e.read().decode("utf-8")).get("error", str(e))
             except Exception:
                 msg = str(e)
-            return gr.update(), gr.update(), f"❌ PE 服務錯誤：{msg}"
+            return gr.update(), gr.update(), f"❌ 改寫服務錯誤（{backend}）：{msg}"
         except Exception as e:
+            host = LLM_HOST if backend == "llm" else PE_HOST
             return gr.update(), gr.update(), (
-                f"❌ 無法連線 PE 服務 ({PE_HOST})：{type(e).__name__}: {e}")
+                f"❌ 無法連線改寫服務 ({host})：{type(e).__name__}: {e}")
 
         new_prompt = r.get("positive_prompt", "")
         ok = r.get("parse_ok")
@@ -967,13 +1067,13 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             note = f"｜沿用 {follow} 的比例" if follow else (f"｜建議 {ratio}" if ratio else "")
 
         flag = "✅" if ok else "⚠️ 未解析出 JSON（已回填原始輸出）"
+        engine = "本機 LLM" if backend == "llm" else "官方 PE"
         return new_prompt, ratio_update, (
-            f"{flag} PE 改寫完成（{task}，{r.get('elapsed')}s，"
-            f"thinking {r.get('thinking_chars')} 字）{note}")
+            f"{flag} {engine} 改寫完成（{task}，{r.get('elapsed')}s）{note}")
 
     btn_pe.click(
         fn=enhance_prompt,
-        inputs=[mode, prompt, editor_input, ref_images_state, seed],
+        inputs=[mode, prompt, editor_input, ref_images_state, seed, pe_backend],
         outputs=[prompt, aspect_ratio, pe_status]
     )
 
