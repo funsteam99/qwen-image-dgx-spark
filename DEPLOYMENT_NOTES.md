@@ -392,3 +392,87 @@ GB10 頻寬僅 273GB/s，這個複製非常昂貴。
 int8_convrot 三項指標全勝且畫質無退步，已將 WebUI 預設改為 int8，
 並保留 bf16 為可選項（`WEIGHT_PRESETS`，UI 右側「⚙️ 權重精度」下拉選單）。
 省下的 14GB 用於 `PE-T2I` 進駐。
+
+---
+
+## 9. 【2026-09-23】官方 Prompt Enhancer 完整上線（PE-I2I + PE-T2I）
+
+### 9.1 為什麼需要
+官方 README 明示：「For best results, we recommend using the official prompt
+rewriting models」。**官網 showcase 的 prompt 幾乎都經過擴寫**，
+拿短句去比對 demo 本來就贏不了 —— 這不是模型能力差距，是輸入品質差距。
+
+官方提供兩個 checkpoint，**各有自己的 system prompt 與訓練目標，不可互換**
+（指向原版 Qwen3.5-VL 9B 會載入也會生成，但多數回應 `parse_ok: false`）：
+| task | checkpoint | 輸入 | 回傳欄位 |
+| :--- | :--- | :--- | :--- |
+| `t2i` | `Qwen/Qwen-Image-2.1-PE-T2I` | 純文字 | `rewritten_prompt`, `wh_ratio` |
+| `edit` | `Qwen/Qwen-Image-2.1-PE-I2I` | 文字 + 1~N 張圖 | `rewritten_prompt`, `wh_ratio`, `ratio_follow` |
+
+### 9.2 部署方式
+容器內無 vLLM（ARM64），故走官方 `run_transformers.py` 參考實作。
+新增 `app/pe_server.py`：常駐 HTTP 服務（127.0.0.1:8200），模型只載入一次。
+**推論邏輯完全複用官方程式碼** —— 直接 import `pe_core` 與 `run_transformers`，
+沿用其 `rewrite()`、`PresencePenalty`、`build_messages`、`parse_answer` 與 profile 取樣參數
+（t2i: presence_penalty 1.5 / max_new_tokens 16256；edit: 0.0 / 24000；皆 `enable_thinking=True`）。
+本檔只負責「載入一次 + HTTP 介面」，不改任何演算法。
+
+**踩坑**：載入必須照官方寫法 `from_pretrained(..., low_cpu_mem_usage=True).to(device)`。
+官方原始碼註解說明這是為了避免產生全精度 CPU 副本 —— 在統一記憶體機器上，
+若改用 `device_map=`，載入瞬間會多吃一份 18GB。
+
+### 9.3 驗證結果
+| | PE-I2I (edit) | PE-T2I (t2i) |
+| :--- | :--- | :--- |
+| `parse_ok` | **True** | **True** |
+| 單次改寫耗時 | 144.3 s | 159.7 s |
+| 模型載入 | 134.7 s | 約 135 s |
+| 回傳欄位 | `ratio_follow: <image1>` | `wh_ratio: 1:1` |
+
+**語言行為差異**（符合兩份 system prompt 的設計）：
+- edit 版跟隨使用者輸入語言（中文指令 → 中文描述）
+- t2i 版一律輸出英文長段落
+
+實例：t2i 輸入「一隻貓坐在窗邊」6 個字，輸出四段約 2,700 字的英文描述，
+涵蓋虎斑紋路、逆光鑲邊、窗框滑軌接縫、玻璃灰塵光點、窗外散景層次、
+淺景深、黃金時刻光向，以及完整色盤指定。
+
+### 9.4 前端整合
+WebUI 按鈕「✨ 官方 Prompt 改寫 (PE)」：
+- 文生圖 → `task=t2i`，回傳的 `wh_ratio` **自動切換尺寸選單**
+- 改圖 → `task=edit`，主圖 + 全部參考圖一併送出；**若使用者有手繪，送的是帶標註的圖**
+  （對應官方 local editing 支援的 circles / painted annotations）
+- `parse_ok: false` 會明確標示，不假裝成功
+
+### 9.5 記憶體事故與修正：PE 服務改為單模型常駐
+
+**事故**：`pe_server.py` 初版設計為「每個 task 各自快取模型、永不卸載」。
+當兩個 task 都被使用時，PE 行程實測衝上 **30GB 以上**，帳面總計：
+
+| 元件 | 記憶體 |
+| :--- | ---: |
+| vLLM `qwen3.8-nvfp4` | 37.5 GB |
+| ComfyUI + int8 影像模型 | 16.9 GB |
+| PE 兩個模型 | ~38 GB |
+| **合計** | **~92 GB / 121 GB** |
+
+帳面尚有餘裕，但統一記憶體架構下 GPU 配置、CUDA context 與 page cache 共用同一池，
+載入期還需額外暫存 —— 結果 **swap 被榨到 15/15 全滿、buff/cache 壓到 0**，
+系統大量換頁而明顯停滯。終止 PE 服務後立即恢復（已用 99GB → 63GB）。
+
+**修正**：改為**同時只保留一個模型**，載入新 task 前先卸載另一個
+（`_unload()`：`gc.collect()` + `torch.cuda.empty_cache()` + `synchronize()`）。
+
+**驗證**：連續呼叫 t2i → edit，記憶體完全未疊加。
+
+| 階段 | used | available | PE 行程 |
+| :--- | ---: | ---: | ---: |
+| 起始 | 63 GB | 57 GB | — |
+| t2i 後 | 82 GB | 39 GB | 18.3 GB |
+| edit 後（已切換） | 82 GB | 39 GB | **18.3 GB** |
+
+日誌：`loaded t2i in 106.9s` → `unloaded t2i` → `loaded edit in 94.7s`，
+兩次 `parse_ok: True`。代價為切換 task 時多約 95 秒重新載入，同一 task 連續使用不受影響。
+
+**教訓**：在統一記憶體機器上，「多個大模型各自常駐」的直覺式快取設計很危險。
+帳面餘裕不等於實際餘裕，應以單一模型為上限並顯式卸載。

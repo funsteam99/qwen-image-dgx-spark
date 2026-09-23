@@ -7,7 +7,7 @@
   - run_transformers.rewrite  (含官方 PresencePenalty 與 enable_thinking=True)
 本檔只負責「載入一次、常駐服務、HTTP 介面」，不改動任何官方演算法。
 """
-import base64, io, json, sys, time, threading, traceback
+import base64, gc, io, json, sys, time, threading, traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -30,10 +30,31 @@ _loaded = {}
 _lock = threading.Lock()
 
 
+def _unload(task):
+    """卸載指定 task 的模型並釋放記憶體。"""
+    entry = _loaded.pop(task, None)
+    if entry is None:
+        return
+    del entry
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+    print(f"[pe] unloaded {task}", flush=True)
+
+
 def get(task):
-    """惰性載入並常駐；官方警告兩個 checkpoint 不可互換，故各自快取。"""
+    """惰性載入，且同時只保留一個模型。
+
+    兩個 PE 各約 19GB。若兩者並存（38GB）再加上 vLLM 與影像模型，
+    會把 128GB 統一記憶體壓到 swap 全滿而使整台機器停滯（實測過）。
+    故載入新模型前，先卸載另一個，讓記憶體用量固定封頂在單一模型的大小。
+    代價是切換 task 時需重新載入（約 135 秒）；同一 task 連續使用不受影響。
+    """
     if task in _loaded:
         return _loaded[task]
+    for other in [t for t in list(_loaded) if t != task]:
+        _unload(other)
     ckpt = CKPTS[task]
     if not Path(ckpt).is_dir():
         raise FileNotFoundError(f"checkpoint 尚未下載: {ckpt}")
@@ -91,6 +112,7 @@ class H(BaseHTTPRequestHandler):
         if self.path == "/health":
             self._send(200, {"ok": True,
                              "loaded": sorted(_loaded),
+                             "policy": "single-model: 載入新 task 前會卸載另一個",
                              "available": {k: Path(v).is_dir() for k, v in CKPTS.items()}})
         else:
             self._send(404, {"error": "not found"})
