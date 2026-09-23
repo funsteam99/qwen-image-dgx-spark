@@ -15,6 +15,11 @@ from PIL import Image, ImageChops
 
 COMFY_HOST = "127.0.0.1:8188"
 
+# 模式識別碼。以穩定 id 取代先前的長字串比對 —— 改標題文字不會再牽動邏輯。
+MODE_EDIT = "edit"
+MODE_MULTI = "multi"
+MODE_T2I = "t2i"
+
 # 權重精度選項。int8_convrot 是官方 ComfyUI 模板的預設值：實測熱機推論快 14%、
 # 冷載入快 2.25 倍、常駐記憶體省 14GB，文字渲染與身分保真皆無退步。
 WEIGHT_PRESETS = {
@@ -199,7 +204,7 @@ def send_to_comfy(
     node_counter = 100
 
     # 模式判斷
-    if mode == "🎯 以圖改圖 (Image Edit)":
+    if mode == MODE_EDIT:
         bg_img, composite_img, mask_img, has_user_drawn = parse_editor_data(editor_input, auto_fill_circles=True)
         if bg_img is None and len(ref_images_list) > 0:
             bg_img = ref_images_list[0]
@@ -253,9 +258,9 @@ def send_to_comfy(
                 }
             }
         else:
-            mode = "✨ 純文字生圖模式 (Text-to-Image)"
+            mode = MODE_T2I
 
-    elif mode == "🖼️ 多圖參考融合與合成模式 (Multi-Image Composition)":
+    elif mode == MODE_MULTI:
         if len(ref_images_list) > 0:
             for idx, ref_img in enumerate(ref_images_list, 1):
                 ref_name = upload_pil_to_comfy(ref_img, prefix=f"ref_{idx}")
@@ -283,9 +288,9 @@ def send_to_comfy(
             latent_source = ["4", 2]
             actual_denoise = 1.0
         else:
-            mode = "✨ 純文字生圖模式 (Text-to-Image)"
+            mode = MODE_T2I
 
-    if mode == "✨ 純文字生圖模式 (Text-to-Image)":
+    if mode == MODE_T2I:
         # 官方 README aspect_ratios (原生 2K，皆為 32 倍數)
         size_map = {
             "1:1 (2048x2048) 官方預設": (2048, 2048),
@@ -396,7 +401,7 @@ OFFICIAL_SAMPLES_DIR = "/workspace/official_samples"
 OFFICIAL_DEMOS = {
     "t2i_neon": {
         "label": "① 文生圖：霓虹招牌",
-        "mode": "✨ 純文字生圖模式 (Text-to-Image)",
+        "mode": MODE_T2I,
         "prompt": 'A neon shop sign that reads "QWEN IMAGE 2.1", rainy night, reflections on wet pavement',
         "ratio": "1:1 (2048x2048) 官方預設",
         "seed": 42,
@@ -405,7 +410,7 @@ OFFICIAL_DEMOS = {
     },
     "t2i_rgba": {
         "label": "② 透明圖 RGBA：卡通龍貼紙",
-        "mode": "✨ 純文字生圖模式 (Text-to-Image)",
+        "mode": MODE_T2I,
         "prompt": "This is an RGBA image with transparency. A cute cartoon dragon sticker. The image has alpha channel and the background is transparent.",
         "ratio": "1:1 (2048x2048) 官方預設",
         "seed": 42,
@@ -414,7 +419,7 @@ OFFICIAL_DEMOS = {
     },
     "t2i_pano": {
         "label": "③ 全景 16:9",
-        "mode": "✨ 純文字生圖模式 (Text-to-Image)",
+        "mode": MODE_T2I,
         "prompt": "A panoramic mountain landscape",
         "ratio": "16:9 (2752x1536) 全景",
         "seed": 42,
@@ -423,7 +428,7 @@ OFFICIAL_DEMOS = {
     },
     "edit_bg": {
         "label": "④ 單圖編輯：換成夕陽海灘",
-        "mode": "🎯 以圖改圖 (Image Edit)",
+        "mode": MODE_EDIT,
         "prompt": "Change the background to a sunset beach",
         "ratio": None,
         "seed": 42,
@@ -432,7 +437,7 @@ OFFICIAL_DEMOS = {
     },
     "edit_denim": {
         "label": "⑤ 換衣（官方模板範例）",
-        "mode": "🎯 以圖改圖 (Image Edit)",
+        "mode": MODE_EDIT,
         "prompt": "Keep the character and pose in <image1> unchanged, put this light blue denim shirt from <image2> on the character, preserve the original facial features, hair, body shape and pose, the denim shirt fits naturally on body, realistic denim fabric texture, natural clothing folds, keep the original background and original lighting, high fashion editorial photography, sharp details",
         "ratio": None,
         "seed": 1070478148268574,
@@ -461,7 +466,8 @@ def load_official_demo(key):
     note = f"　⚠️ 缺少素材：{', '.join(missing)}" if missing else ""
 
     return (
-        gr.update(value=d["mode"]),
+        d["mode"],                       # gr.State：模式識別碼
+        gr.Tabs(selected=d["mode"]),     # 切換到對應分頁
         d["prompt"],
         ratio_val,
         gr.update(value=40),      # 官方 num_inference_steps
@@ -470,8 +476,8 @@ def load_official_demo(key):
         editor_val,
         refs,
         refs,
-        gr.update(visible=(d["mode"] == "🎯 以圖改圖 (Image Edit)")),
-        gr.update(visible=(d["mode"] != "✨ 純文字生圖模式 (Text-to-Image)")),
+        gr.update(visible=(d["mode"] == MODE_EDIT)),
+        gr.update(visible=(d["mode"] != MODE_T2I)),
         f"📋 已載入「{d['label']}」：{d['tip']}{note}",
     )
 
@@ -642,7 +648,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                     btn_purge = gr.Button("💣 清空全部", variant="stop")
                     purge_status = gr.Markdown("")
 
-    with gr.Accordion("🏆 官網範例一鍵復現 (Reproduce Official Demos)", open=True):
+    with gr.Accordion("🏆 官網範例一鍵復現 (Reproduce Official Demos)", open=False):
         gr.Markdown(
             "點擊後會自動套用**官方原始的提示詞、尺寸、步數 40、CFG 1.0、seed 與輸入圖**，"
             "接著直接按 🚀 生成即可。用來判斷本機部署是否已對齊官方表現。"
@@ -657,15 +663,16 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
 
     with gr.Row():
         with gr.Column(scale=5):
-            mode = gr.Radio(
-                choices=[
-                    "🎯 以圖改圖 (Image Edit)",
-                    "🖼️ 多圖參考融合與合成模式 (Multi-Image Composition)",
-                    "✨ 純文字生圖模式 (Text-to-Image)"
-                ],
-                value="🎯 以圖改圖 (Image Edit)",
-                label="🎯 主要操作模式"
-            )
+            # 分頁僅作為模式選擇器；畫布與參考圖庫為三個模式共用，
+            # 故留在分頁之外，靠既有的顯示/隱藏邏輯切換，避免重複元件與狀態同步問題。
+            mode = gr.State(MODE_EDIT)
+            with gr.Tabs() as mode_tabs:
+                with gr.TabItem("🎯 以圖改圖", id=MODE_EDIT):
+                    gr.Markdown("上傳主圖後下指令。可用筆刷圈選要修改的位置，並加掛最多 10 張參考圖。")
+                with gr.TabItem("🖼️ 多圖參考融合", id=MODE_MULTI):
+                    gr.Markdown("貼上多張參考圖，用 `<image1>`、`<image2>` … 在提示詞中指名合成。")
+                with gr.TabItem("✨ 純文字生圖", id=MODE_T2I):
+                    gr.Markdown("不需圖片，直接輸入提示詞。尺寸由右側「生成參數」決定。")
             
             # --- 模式 1 容器: 畫布塗抹/圈選 ---
             with gr.Group(visible=True) as edit_canvas_container:
@@ -728,7 +735,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 btn_pe = gr.Button("✨ 官方 Prompt 改寫 (PE)", variant="secondary", size="lg")
                 pe_status = gr.Markdown("")
 
-            with gr.Accordion("💡 官方 GitHub 標準提示詞範本 (一鍵填入)", open=True):
+            with gr.Accordion("💡 官方 GitHub 標準提示詞範本 (一鍵填入)", open=False):
                 gr.Markdown("*遵循官方 `system_prompt_edit.txt` 規範：使用 `<imageX>` 明確指定主體與部件，並加入光影與細節保持約束。*")
                 with gr.Row():
                     btn_tpl_outfit5 = gr.Button("五圖合成穿搭寫真", size="sm")
@@ -746,7 +753,10 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             run_btn = gr.Button("🚀 開始執行生成 / 替換 (Execute)", variant="primary", size="lg")
 
         with gr.Column(scale=4):
-            with gr.Accordion("⚙️ 生成參數設定 (已對齊官方 GitHub 標準)", open=True):
+            # ⚠️ 必須保持展開：Gradio 6 的折疊 Accordion 不渲染子元件，
+            # 提交時會送出預設值而非畫面上的值（實測 seed 顯示官方值、送出卻是 -1）。
+            # 這些控制項是 run_btn 的 inputs，run_btn 在本區塊之外，故不可折疊。
+            with gr.Accordion("⚙️ 生成參數設定 (2K / 40 步 / CFG 1.0 / int8，已對齊官方)", open=True):
                 aspect_ratio = gr.Dropdown(
                     choices=[
                         "1:1 (2048x2048) 官方預設",
@@ -868,20 +878,29 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
 
     # 模式切換動態顯示/隱藏容器
     def on_mode_change(m):
-        is_canvas = (m == "🎯 以圖改圖 (Image Edit)")
-        is_multi = (m == "🖼️ 多圖參考融合與合成模式 (Multi-Image Composition)")
+        is_canvas = (m == MODE_EDIT)
+        is_multi = (m == MODE_MULTI)
         return gr.update(visible=is_canvas), gr.update(visible=(is_canvas or is_multi))
 
-    mode.change(
-        fn=on_mode_change,
-        inputs=[mode],
-        outputs=[edit_canvas_container, ref_images_container],
+    def on_tab_select(evt: gr.SelectData):
+        m = evt.value if isinstance(evt.value, str) else MODE_EDIT
+        # Gradio 回傳的是頁籤標題，對照回識別碼
+        m = {"🎯 以圖改圖": MODE_EDIT,
+             "🖼️ 多圖參考融合": MODE_MULTI,
+             "✨ 純文字生圖": MODE_T2I}.get(m, MODE_EDIT)
+        vis_canvas, vis_refs = on_mode_change(m)
+        return m, vis_canvas, vis_refs
+
+    mode_tabs.select(
+        fn=on_tab_select,
+        inputs=None,
+        outputs=[mode, edit_canvas_container, ref_images_container],
         queue=False          # 純前端顯示切換，不可排在生圖長任務後面
     )
 
     # 官網範例一鍵復現
     _demo_outputs = [
-        mode, prompt, aspect_ratio, steps, cfg, seed,
+        mode, mode_tabs, prompt, aspect_ratio, steps, cfg, seed,
         editor_input, ref_images_state, ref_gallery,
         edit_canvas_container, ref_images_container, demo_status,
     ]
@@ -905,7 +924,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             return gr.update(), gr.update(), "⚠️ 請先輸入提示詞再改寫。"
 
         refs = refs or []
-        if m == "✨ 純文字生圖模式 (Text-to-Image)":
+        if m == MODE_T2I:
             task, imgs = "t2i", []
         else:
             task = "edit"
