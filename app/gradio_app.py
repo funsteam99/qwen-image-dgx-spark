@@ -6,6 +6,9 @@ import io
 import time
 import os
 import base64
+import shutil
+import tempfile
+import zipfile
 import numpy as np
 import scipy.ndimage
 from PIL import Image, ImageChops
@@ -461,6 +464,128 @@ def load_official_demo(key):
     )
 
 
+
+# =============================================================================
+# 產物管理：打包下載 / 清理
+# Gradio 容器掛載 /home/<user>/qwen-image -> /workspace，故可直接存取 ComfyUI 目錄。
+# =============================================================================
+COMFY_OUTPUT_DIR = os.environ.get("COMFY_OUTPUT_DIR", "/workspace/ComfyUI/output")
+COMFY_INPUT_DIR = os.environ.get("COMFY_INPUT_DIR", "/workspace/ComfyUI/input")
+
+
+def _human(n):
+    for u in ("B", "KB", "MB", "GB"):
+        if n < 1024 or u == "GB":
+            return f"{n:.1f}{u}" if u != "B" else f"{int(n)}B"
+        n /= 1024.0
+
+
+def _collect(directory, days):
+    """回傳 (檔案清單, 總位元組)。days<=0 表示不限時間，全部納入。"""
+    if not os.path.isdir(directory):
+        return [], 0
+    cutoff = time.time() - days * 86400 if days > 0 else None
+    files, total = [], 0
+    for name in os.listdir(directory):
+        fp = os.path.join(directory, name)
+        if not os.path.isfile(fp):
+            continue
+        st = os.stat(fp)
+        if cutoff is not None and st.st_mtime < cutoff:
+            continue
+        files.append(fp)
+        total += st.st_size
+    files.sort(key=lambda f: os.path.getmtime(f), reverse=True)
+    return files, total
+
+
+def pack_outputs(days):
+    """把輸出圖片打包成 zip 供下載。days=0 表示全部。"""
+    days = int(days)
+    files, total = _collect(COMFY_OUTPUT_DIR, days)
+    if not files:
+        scope = "全部" if days <= 0 else f"最近 {days} 天"
+        return None, f"⚠️ {scope}沒有可打包的圖片。"
+    stamp = time.strftime("%Y%m%d_%H%M%S")
+    zip_path = os.path.join(tempfile.gettempdir(), f"qwen_outputs_{stamp}.zip")
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as z:  # PNG 已壓縮，不再重壓
+        for fp in files:
+            z.write(fp, arcname=os.path.basename(fp))
+    zsize = os.path.getsize(zip_path)
+    scope = "全部" if days <= 0 else f"最近 {days} 天"
+    return zip_path, f"✅ 已打包{scope} **{len(files)} 張**圖片（原始 {_human(total)}，壓縮檔 {_human(zsize)}）。點下方檔案下載。"
+
+
+def _delete(files):
+    """刪除檔案清單，回傳 (成功數, 失敗數, 釋放位元組)。"""
+    ok = errs = freed = 0
+    for f in files:
+        try:
+            sz = os.path.getsize(f)
+            os.remove(f)
+            ok += 1
+            freed += sz
+        except OSError:
+            errs += 1
+    return ok, errs, freed
+
+
+#: 這些是 ComfyUI 自帶的佔位檔，任何情況都不刪
+PROTECTED_NAMES = {"example.png", "_output_images_will_be_put_here",
+                   "put_input_images_here", ".keep", ".gitkeep"}
+
+
+def _purgeable(directory):
+    """回傳該目錄可刪除的檔案，新到舊排序。"""
+    files, _ = _collect(directory, 0)
+    return [f for f in files if os.path.basename(f) not in PROTECTED_NAMES]
+
+
+def cleanup_keep_recent(keep_out, keep_in, confirm):
+    """只保留最近 N 張，其餘刪除。N=0 表示該項不處理。"""
+    keep_out, keep_in = int(keep_out), int(keep_in)
+    lines = []
+    for label, directory, keep in (
+        ("輸出圖片", COMFY_OUTPUT_DIR, keep_out),
+        ("上傳暫存", COMFY_INPUT_DIR, keep_in),
+    ):
+        files = _purgeable(directory)
+        if keep <= 0:
+            lines.append(f"- **{label}**：共 {len(files)} 張 — 保留張數設為 0，略過")
+            continue
+        victims = files[keep:]          # _collect 已由新到舊排序
+        if not victims:
+            lines.append(f"- **{label}**：共 {len(files)} 張，未超過保留上限 {keep} 張，無需清理")
+            continue
+        size = sum(os.path.getsize(f) for f in victims)
+        if confirm:
+            ok, errs, freed = _delete(victims)
+            lines.append(f"- **{label}**：已刪除 **{ok}** 張較舊的，保留最近 {keep} 張，釋放 **{_human(freed)}**"
+                         + (f"（{errs} 個失敗）" if errs else ""))
+        else:
+            lines.append(f"- **{label}**：共 {len(files)} 張，將刪除較舊的 **{len(victims)}** 張、"
+                         f"保留最近 {keep} 張，可釋放 **{_human(size)}**")
+
+    head = "🗑️ **已執行清理**" if confirm else "🔍 **預演結果（未刪除任何檔案）**"
+    tail = "" if confirm else "\n\n勾選「我確認刪除」後再按一次，才會真的刪除。"
+    return head + "\n" + "\n".join(lines) + tail
+
+
+def purge_all(confirm_text):
+    """清空全部產物。必須輸入 DELETE 才執行，避免誤觸。"""
+    out_files = _purgeable(COMFY_OUTPUT_DIR)
+    in_files = _purgeable(COMFY_INPUT_DIR)
+    size = sum(os.path.getsize(f) for f in out_files + in_files)
+    if (confirm_text or "").strip().upper() != "DELETE":
+        return (f"⚠️ **尚未執行。** 將清空輸出 **{len(out_files)}** 張 + 上傳暫存 **{len(in_files)}** 個，"
+                f"合計 **{_human(size)}**。\n\n確定要全部刪除，請在欄位輸入 `DELETE` 後再按一次。")
+    ok1, e1, f1 = _delete(out_files)
+    ok2, e2, f2 = _delete(in_files)
+    errs = e1 + e2
+    return (f"🗑️ **已清空。** 輸出刪除 **{ok1}** 張、上傳暫存刪除 **{ok2}** 個，"
+            f"釋放 **{_human(f1 + f2)}**" + (f"（{errs} 個失敗）" if errs else ""))
+
+
 custom_css = '''
 .output-checkerboard {
     background-image: linear-gradient(45deg, #ddd 25%, transparent 25%), 
@@ -482,6 +607,29 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
     gr.Markdown("# 🎨 Qwen-Image-2.1 影像生成與智能圈選編輯平台 (官方規範版)")
     gr.Markdown("**硬體**: NVIDIA DGX Spark (GB10 Grace Blackwell ARM64) | **標準**: Single-Stream MMDiT + Qwen3-VL | **官方標準**: CFG 1.0 | Euler + Simple | 支援 1~10 張多圖參考")
     
+    with gr.Accordion("🗂️ 產物管理 (打包下載 / 清理)", open=False):
+        with gr.Row():
+            with gr.Column():
+                gr.Markdown("**📦 打包下載**　把伺服器上的輸出圖片打包成 zip")
+                pack_days = gr.Number(value=7, precision=0, label="打包最近幾天 (0 = 全部)")
+                btn_pack = gr.Button("📦 打包下載", variant="secondary")
+                pack_status = gr.Markdown("")
+                pack_file = gr.File(label="下載 zip", interactive=False)
+            with gr.Column():
+                gr.Markdown("**🗑️ 清理**　保留最近 N 張，其餘刪除。預設只預演，勾選確認才會刪除")
+                with gr.Row():
+                    keep_out = gr.Number(value=100, precision=0, label="輸出圖片保留最近幾張 (0=不刪)")
+                    keep_in = gr.Number(value=20, precision=0, label="上傳暫存保留最近幾個 (0=不刪)")
+                confirm_del = gr.Checkbox(value=False, label="⚠️ 我確認刪除（不勾選只做預演）")
+                btn_clean = gr.Button("🗑️ 執行清理", variant="stop")
+                clean_status = gr.Markdown("")
+
+                with gr.Accordion("💣 清空全部（危險）", open=False):
+                    gr.Markdown("刪除**所有**輸出圖片與上傳暫存，不可復原。請先按一次查看數量。")
+                    purge_text = gr.Textbox(label="輸入 DELETE 以確認", placeholder="DELETE", lines=1)
+                    btn_purge = gr.Button("💣 清空全部", variant="stop")
+                    purge_status = gr.Markdown("")
+
     with gr.Accordion("🏆 官網範例一鍵復現 (Reproduce Official Demos)", open=True):
         gr.Markdown(
             "點擊後會自動套用**官方原始的提示詞、尺寸、步數 40、CFG 1.0、seed 與輸入圖**，"
@@ -791,6 +939,12 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
         inputs=[mode, prompt, editor_input, ref_images_state, seed],
         outputs=[prompt, aspect_ratio, pe_status]
     )
+
+    btn_pack.click(fn=pack_outputs, inputs=[pack_days],
+                   outputs=[pack_file, pack_status])
+    btn_clean.click(fn=cleanup_keep_recent, inputs=[keep_out, keep_in, confirm_del],
+                    outputs=[clean_status])
+    btn_purge.click(fn=purge_all, inputs=[purge_text], outputs=[purge_status])
 
     run_btn.click(
         fn=send_to_comfy,
