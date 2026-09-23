@@ -251,7 +251,8 @@ def send_to_comfy(
     steps, 
     cfg, 
     seed,
-    precision=DEFAULT_PRECISION
+    precision=DEFAULT_PRECISION,
+    original_prompt=""
 ):
     ref_images_list = ref_images_list or []
     unet_name, clip_name = WEIGHT_PRESETS.get(precision, WEIGHT_PRESETS[DEFAULT_PRECISION])
@@ -435,10 +436,12 @@ def send_to_comfy(
             "vae": ["3", 0]
         }
     }
+    # 檔名帶時間戳：清理輸出後 ComfyUI 的流水號會從 00001 重來，
+    # 固定前綴會讓新檔覆用舊檔名，使「回看」的舊紀錄指向內容已不同的圖（靜默錯誤）。
     workflow["8"] = {
         "class_type": "SaveImage",
         "inputs": {
-            "filename_prefix": "QwenImage21_Out",
+            "filename_prefix": time.strftime("QwenImage21_%Y%m%d_%H%M%S"),
             "images": ["7", 0]
         }
     }
@@ -467,7 +470,15 @@ def send_to_comfy(
             img_url = (f"http://{COMFY_HOST}/view?filename={img_info['filename']}"
                        f"&subfolder={img_info['subfolder']}&type={img_info['type']}")
             with urllib.request.urlopen(img_url) as img_resp:
-                return Image.open(io.BytesIO(img_resp.read()))
+                out_img = Image.open(io.BytesIO(img_resp.read()))
+            log_generation(original_prompt, prompt, img_info["filename"], {
+                "mode": mode,
+                "size": f"{out_img.width}x{out_img.height}",
+                "seed": workflow["6"]["inputs"]["seed"],
+                "steps": int(steps),
+                "precision": unet_name,
+            })
+            return out_img
         status = entry.get("status", {})
         if status.get("status_str") and status.get("status_str") != "success":
             msgs = json.dumps(status.get("messages", [])[-2:], ensure_ascii=False)[:500]
@@ -569,6 +580,96 @@ def load_official_demo(key):
         f"📋 已載入「{d['label']}」：{d['tip']}{note}",
     )
 
+
+
+
+# =============================================================================
+# 回看：生成歷史
+# ComfyUI 的 /history 只保留「實際送出」的提示詞（即擴寫後的），
+# 原始短句只存在於前端，故在此自行記錄成 JSONL。
+# =============================================================================
+HISTORY_LOG = os.environ.get("HISTORY_LOG", "/workspace/generation_history.jsonl")
+HISTORY_MAX_ROWS = 30
+THUMB_WIDTH = 220
+
+
+def log_generation(original_prompt, final_prompt, filename, meta):
+    """附加一筆生成紀錄。失敗不得影響出圖，故整段吞例外。"""
+    try:
+        rec = {
+            "ts": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "original": (original_prompt or "").strip(),
+            "final": (final_prompt or "").strip(),
+            "file": filename,
+            **meta,
+        }
+        with open(HISTORY_LOG, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _thumb_data_uri(filename):
+    """讀取輸出圖並縮成縮圖的 base64 data URI。"""
+    path = os.path.join(COMFY_OUTPUT_DIR, filename)
+    if not os.path.isfile(path):
+        return None
+    im = Image.open(path)
+    im.thumbnail((THUMB_WIDTH, THUMB_WIDTH), Image.LANCZOS)
+    if im.mode not in ("RGB", "RGBA"):
+        im = im.convert("RGB")
+    buf = io.BytesIO()
+    im.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _esc(t):
+    return (t or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def build_history_html(limit=HISTORY_MAX_ROWS):
+    """組出回看表格。縮圖內嵌為 data URI，點擊則以 Gradio 檔案端點開啟原圖。"""
+    if not os.path.isfile(HISTORY_LOG):
+        return "<p>尚無紀錄。生成一張圖後按「🔄 重新整理」即可看到。</p>"
+    rows = []
+    with open(HISTORY_LOG, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rows.append(json.loads(line))
+            except Exception:
+                continue
+    rows = rows[::-1][:int(limit or HISTORY_MAX_ROWS)]
+    if not rows:
+        return "<p>尚無紀錄。</p>"
+
+    html = ['<div style="overflow-x:auto"><table class="review-table">',
+            '<thead><tr><th style="width:130px">時間</th>'
+            '<th style="width:22%">原始提示</th><th>擴寫提示</th>'
+            f'<th style="width:{THUMB_WIDTH + 20}px">圖片</th></tr></thead><tbody>']
+    for r in rows:
+        fn = r.get("file") or ""
+        uri = _thumb_data_uri(fn)
+        full = f"/gradio_api/file={COMFY_OUTPUT_DIR}/{fn}"
+        if uri:
+            img = (f'<a href="{full}" target="_blank" title="點擊看原圖">'
+                   f'<img src="{uri}" style="max-width:100%;border-radius:6px"></a>')
+        else:
+            img = '<span style="opacity:.5">（檔案已清理）</span>'
+        orig = _esc(r.get("original")) or '<span style="opacity:.5">（未改寫）</span>'
+        meta = f'{r.get("mode","")} · {r.get("size","")} · seed {r.get("seed","")}'
+        html.append(
+            "<tr>"
+            f'<td style="white-space:nowrap;vertical-align:top">{_esc(r.get("ts"))}'
+            f'<div style="opacity:.55;font-size:.82em;margin-top:4px">{_esc(meta)}</div></td>'
+            f'<td style="vertical-align:top">{orig}</td>'
+            f'<td style="vertical-align:top">{_esc(r.get("final"))}</td>'
+            f'<td style="vertical-align:top">{img}</td>'
+            "</tr>")
+    html.append("</tbody></table></div>")
+    return "".join(html)
 
 
 # =============================================================================
@@ -709,6 +810,8 @@ custom_css = '''
 
 with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=custom_css) as demo:
     ref_images_state = gr.State([])
+    # 保存改寫前的原始提示詞，供「回看」對照用
+    orig_prompt_state = gr.State("")
     
     gr.Markdown("# 🎨 Qwen-Image-2.1 影像生成與智能圈選編輯平台 (官方規範版)")
     gr.Markdown("**硬體**: NVIDIA DGX Spark (GB10 Grace Blackwell ARM64) | **標準**: Single-Stream MMDiT + Qwen3-VL | **官方標準**: CFG 1.0 | Euler + Simple | 支援 1~10 張多圖參考")
@@ -887,6 +990,12 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
         )
         seed = gr.Number(value=-1, label="隨機種子 (Seed, -1 為隨機)", precision=0)
 
+    with gr.Accordion("🕘 回看 (生成紀錄)", open=False):
+        with gr.Row():
+            hist_limit = gr.Number(value=10, precision=0, label="顯示最近幾筆", scale=1)
+            btn_hist = gr.Button("🔄 重新整理", scale=1)
+        hist_html = gr.HTML("<p>按「🔄 重新整理」載入紀錄。</p>")
+
     # --- 參考圖動態管理邏輯 ---
     def add_single_ref(new_img, current_list):
         current_list = list(current_list or [])
@@ -1016,7 +1125,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
     def enhance_prompt(m, p_text, editor_data, refs, sd, backend_label):
         """官方 Prompt Enhancer：短 prompt -> 擴寫 prompt，並套用官方建議畫布比例。"""
         if not (p_text or "").strip():
-            return gr.update(), gr.update(), "⚠️ 請先輸入提示詞再改寫。"
+            return gr.update(), gr.update(), gr.update(), "⚠️ 請先輸入提示詞再改寫。"
 
         refs = refs or []
         if m == MODE_T2I:
@@ -1033,7 +1142,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 imgs.append(main_img)
             imgs.extend(refs)
             if not imgs:
-                return gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
+                return gr.update(), gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
 
         backend = PE_BACKENDS.get(backend_label, "llm")
         try:
@@ -1046,10 +1155,10 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 msg = json.loads(e.read().decode("utf-8")).get("error", str(e))
             except Exception:
                 msg = str(e)
-            return gr.update(), gr.update(), f"❌ 改寫服務錯誤（{backend}）：{msg}"
+            return gr.update(), gr.update(), gr.update(), f"❌ 改寫服務錯誤（{backend}）：{msg}"
         except Exception as e:
             host = LLM_HOST if backend == "llm" else PE_HOST
-            return gr.update(), gr.update(), (
+            return gr.update(), gr.update(), gr.update(), (
                 f"❌ 無法連線改寫服務 ({host})：{type(e).__name__}: {e}")
 
         new_prompt = r.get("positive_prompt", "")
@@ -1068,14 +1177,17 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
 
         flag = "✅" if ok else "⚠️ 未解析出 JSON（已回填原始輸出）"
         engine = "本機 LLM" if backend == "llm" else "官方 PE"
-        return new_prompt, ratio_update, (
+        return new_prompt, ratio_update, p_text, (
             f"{flag} {engine} 改寫完成（{task}，{r.get('elapsed')}s）{note}")
 
     btn_pe.click(
         fn=enhance_prompt,
         inputs=[mode, prompt, editor_input, ref_images_state, seed, pe_backend],
-        outputs=[prompt, aspect_ratio, pe_status]
+        outputs=[prompt, aspect_ratio, orig_prompt_state, pe_status]
     )
+
+    btn_hist.click(fn=build_history_html, inputs=[hist_limit],
+                   outputs=[hist_html], queue=False)
 
     btn_pack.click(fn=pack_outputs, inputs=[pack_days],
                    outputs=[pack_file, pack_status])
@@ -1096,7 +1208,8 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             steps, 
             cfg, 
             seed,
-            precision
+            precision,
+            orig_prompt_state
         ],
         outputs=output_img
     )
@@ -1158,4 +1271,6 @@ window.addEventListener('paste', (e) => {
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=4)
-    demo.launch(server_name="0.0.0.0", server_port=7860, share=False, head=paste_helper_script)
+    demo.launch(server_name="0.0.0.0", server_port=7860, share=False,
+                head=paste_helper_script,
+                allowed_paths=[COMFY_OUTPUT_DIR])
