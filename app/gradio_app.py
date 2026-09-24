@@ -962,15 +962,14 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 )
 
             orig_prompt_display = gr.Textbox(
-                label="🔒 原始提示詞（改寫前，唯讀）",
-                placeholder="按下方「Prompt 改寫」後，改寫前的原始輸入會顯示於此，供對照",
-                lines=2,
-                interactive=False
+                label="📝 原始提示詞（手動輸入，每次按「Prompt 改寫」都以這裡的內容為準）",
+                placeholder="在這裡輸入你的指令，例如：一隻橘貓坐在窗台上看著窗外下雨，水彩畫風格",
+                lines=2
             )
 
             prompt = gr.Textbox(
-                label="✏️ 修改指令 / 提示詞 (Prompt - 建議依官方規範使用 <image1>, <image2> 錨定)",
-                placeholder="例如：A high-fashion full-body portrait of the model from <image1>, wearing clothing from <image2>...",
+                label="✨ 擴寫後提示詞 (Prompt - 會送去生成；建議依官方規範使用 <image1>, <image2> 錨定)",
+                placeholder="按上方輸入原始提示詞後，點「Prompt 改寫」產生的結果會顯示於此；也可直接在此手動輸入",
                 lines=3
             )
 
@@ -1174,10 +1173,13 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             queue=False
         )
 
-    def enhance_prompt(m, p_text, editor_data, refs, sd, backend_label):
-        """官方 Prompt Enhancer：短 prompt -> 擴寫 prompt，並套用官方建議畫布比例。"""
+    def enhance_prompt(m, orig_text, editor_data, refs, sd, backend_label):
+        """官方 Prompt Enhancer：拿「原始提示詞」欄位當下的內容去改寫，
+        每次按下都以該欄位為準，覆蓋上一次的擴寫結果；原始欄位本身永不被程式改動。
+        """
+        p_text = orig_text
         if not (p_text or "").strip():
-            return gr.update(), gr.update(), gr.update(), gr.update(), "⚠️ 請先輸入提示詞再改寫。"
+            return gr.update(), gr.update(), gr.update(), "⚠️ 請先在「原始提示詞」欄位輸入內容再改寫。"
 
         refs = refs or []
         if m == MODE_T2I:
@@ -1194,14 +1196,14 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 imgs.append(main_img)
             imgs.extend(refs)
             if not imgs:
-                return gr.update(), gr.update(), gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
+                return gr.update(), gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
 
         backend = PE_BACKENDS.get(backend_label, "auto")
         endpoint = None
         if backend != "pe":
             _key, endpoint, warn = pick_endpoint(backend, task)
             if warn:
-                return gr.update(), gr.update(), gr.update(), gr.update(), warn
+                return gr.update(), gr.update(), gr.update(), warn
         try:
             if backend == "pe":
                 r = call_pe(task, p_text, imgs, sd)
@@ -1212,10 +1214,10 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 msg = json.loads(e.read().decode("utf-8")).get("error", str(e))
             except Exception:
                 msg = str(e)
-            return gr.update(), gr.update(), gr.update(), gr.update(), f"❌ 改寫服務錯誤（{backend}）：{msg}"
+            return gr.update(), gr.update(), gr.update(), f"❌ 改寫服務錯誤（{backend}）：{msg}"
         except Exception as e:
             host = PE_HOST if backend == "pe" else endpoint["host"]
-            return gr.update(), gr.update(), gr.update(), gr.update(), (
+            return gr.update(), gr.update(), gr.update(), (
                 f"❌ 無法連線改寫服務 ({host})：{type(e).__name__}: {e}")
 
         new_prompt = r.get("positive_prompt", "")
@@ -1235,19 +1237,20 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
         engine = "官方 PE" if backend == "pe" else endpoint["label"]
         if not ok:
             # 解析失敗時原始輸出可能混雜語言或殘留 JSON 片段，不可污染提示詞欄位，
-            # 保留使用者輸入的原始提示詞，並把可疑輸出留在狀態列供排查。
+            # 「擴寫後」欄位保持原樣不變，可疑輸出留在狀態列供排查。
             preview = new_prompt.replace("\n", " ")[:200]
-            flag = "⚠️ 未解析出 JSON，已保留原始提示詞未改寫"
-            return gr.update(), ratio_update, p_text, p_text, (
+            flag = "⚠️ 未解析出 JSON，「擴寫後」欄位維持不變"
+            return gr.update(), ratio_update, p_text, (
                 f"{flag}｜{engine}（{task}，{r.get('elapsed')}s）{note}｜原始輸出：{preview}")
 
-        return new_prompt, ratio_update, p_text, p_text, (
+        # 每次擴寫成功都覆蓋「擴寫後」欄位（不動「原始提示詞」欄位）
+        return new_prompt, ratio_update, p_text, (
             f"✅ {engine} 改寫完成（{task}，{r.get('elapsed')}s）{note}")
 
     btn_pe.click(
         fn=enhance_prompt,
-        inputs=[mode, prompt, editor_input, ref_images_state, seed, pe_backend],
-        outputs=[prompt, aspect_ratio, orig_prompt_state, orig_prompt_display, pe_status]
+        inputs=[mode, orig_prompt_display, editor_input, ref_images_state, seed, pe_backend],
+        outputs=[prompt, aspect_ratio, orig_prompt_state, pe_status]
     )
 
     btn_hist.click(fn=build_history_html, inputs=[hist_limit],
