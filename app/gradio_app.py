@@ -299,6 +299,9 @@ def send_to_comfy(
     precision=DEFAULT_PRECISION,
     original_prompt=""
 ):
+    # 「擴寫後」欄位若是空的（例如使用者只打了原始提示詞、還沒按「Prompt 改寫」就直接生成），
+    # 就退回用「原始提示詞」欄位的內容送去生成，避免送出空提示詞。
+    prompt = (prompt or "").strip() or (original_prompt or "").strip()
     ref_images_list = ref_images_list or []
     unet_name, clip_name = WEIGHT_PRESETS.get(precision, WEIGHT_PRESETS[DEFAULT_PRECISION])
     
@@ -856,7 +859,6 @@ custom_css = '''
 with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=custom_css) as demo:
     ref_images_state = gr.State([])
     # 保存改寫前的原始提示詞，供「回看」對照用
-    orig_prompt_state = gr.State("")
     
     gr.Markdown("# 🎨 Qwen-Image-2.1 影像生成與智能圈選編輯平台 (官方規範版)")
     gr.Markdown("**硬體**: NVIDIA DGX Spark (GB10 Grace Blackwell ARM64) | **標準**: Single-Stream MMDiT + Qwen3-VL | **官方標準**: CFG 1.0 | Euler + Simple | 支援 1~10 張多圖參考")
@@ -1179,7 +1181,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
         """
         p_text = orig_text
         if not (p_text or "").strip():
-            return gr.update(), gr.update(), gr.update(), "⚠️ 請先在「原始提示詞」欄位輸入內容再改寫。"
+            return gr.update(), gr.update(), "⚠️ 請先在「原始提示詞」欄位輸入內容再改寫。"
 
         refs = refs or []
         if m == MODE_T2I:
@@ -1196,14 +1198,14 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 imgs.append(main_img)
             imgs.extend(refs)
             if not imgs:
-                return gr.update(), gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
+                return gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
 
         backend = PE_BACKENDS.get(backend_label, "auto")
         endpoint = None
         if backend != "pe":
             _key, endpoint, warn = pick_endpoint(backend, task)
             if warn:
-                return gr.update(), gr.update(), gr.update(), warn
+                return gr.update(), gr.update(), warn
         try:
             if backend == "pe":
                 r = call_pe(task, p_text, imgs, sd)
@@ -1214,10 +1216,10 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 msg = json.loads(e.read().decode("utf-8")).get("error", str(e))
             except Exception:
                 msg = str(e)
-            return gr.update(), gr.update(), gr.update(), f"❌ 改寫服務錯誤（{backend}）：{msg}"
+            return gr.update(), gr.update(), f"❌ 改寫服務錯誤（{backend}）：{msg}"
         except Exception as e:
             host = PE_HOST if backend == "pe" else endpoint["host"]
-            return gr.update(), gr.update(), gr.update(), (
+            return gr.update(), gr.update(), (
                 f"❌ 無法連線改寫服務 ({host})：{type(e).__name__}: {e}")
 
         new_prompt = r.get("positive_prompt", "")
@@ -1240,17 +1242,17 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             # 「擴寫後」欄位保持原樣不變，可疑輸出留在狀態列供排查。
             preview = new_prompt.replace("\n", " ")[:200]
             flag = "⚠️ 未解析出 JSON，「擴寫後」欄位維持不變"
-            return gr.update(), ratio_update, p_text, (
+            return gr.update(), ratio_update, (
                 f"{flag}｜{engine}（{task}，{r.get('elapsed')}s）{note}｜原始輸出：{preview}")
 
         # 每次擴寫成功都覆蓋「擴寫後」欄位（不動「原始提示詞」欄位）
-        return new_prompt, ratio_update, p_text, (
+        return new_prompt, ratio_update, (
             f"✅ {engine} 改寫完成（{task}，{r.get('elapsed')}s）{note}")
 
     btn_pe.click(
         fn=enhance_prompt,
         inputs=[mode, orig_prompt_display, editor_input, ref_images_state, seed, pe_backend],
-        outputs=[prompt, aspect_ratio, orig_prompt_state, pe_status]
+        outputs=[prompt, aspect_ratio, pe_status]
     )
 
     btn_hist.click(fn=build_history_html, inputs=[hist_limit],
@@ -1276,7 +1278,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             cfg, 
             seed,
             precision,
-            orig_prompt_state
+            orig_prompt_display
         ],
         outputs=output_img
     )
