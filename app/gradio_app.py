@@ -36,19 +36,19 @@ PE_HOST = "127.0.0.1:8200"   # 官方 Prompt Enhancer 常駐服務 (pe/pe_server
 # 實測 t2i 28.2s / edit 17.6s，皆 parse_ok=True，且零額外記憶體與磁碟。
 # 官方 PE 模型走 transformers batch-1，同樣任務需 144~160s，另需 19GB 常駐。
 # 官方雖警告非微調模型未必穩定遵守輸出格式，故保留其為可選後端。
-# 兩個本機 LLM 端點，能力不同：
-#   8002  Qwen3.6-35B GGUF (llama.cpp)  純文字，無 mmproj —— 送圖會回 HTTP 500
-#         文生圖改寫實測 8.2 秒
-#   8006  qwen3.8-27B-NVFP4 (vLLM)      具視覺能力，文生圖約 22~31 秒、改圖約 17.6 秒
-# 故依任務分流：文生圖走 8002 取其速度，改圖必須走 8006。
+# 兩個本機 LLM 端點，2026-09-24 起皆已具備視覺能力（8002 原本無 mmproj 送圖回
+# HTTP 500，已於服務端更新補上）：
+#   8002  Qwen3.6-35B GGUF (llama.cpp)  文生圖改寫實測 8.2 秒，速度較快
+#   8006  qwen3.8-27B-NVFP4 (vLLM)      文生圖約 22~31 秒、改圖約 17.6 秒
+# 兩者速度/品質仍可能有差異，故不再自動路由，預設固定用 8002，由使用者視需要手動切換。
 LLM_ENDPOINTS = {
     "8002": {"host": os.environ.get("LLM_HOST_TEXT", "127.0.0.1:8002"),
              "model": os.environ.get("LLM_MODEL_TEXT",
                                      "Qwen3.6-35B-A3B-abliterated.i1-Q4_K_M.gguf"),
-             "vision": False, "label": "8002 Qwen3.6 (純文字, 最快)"},
+             "vision": True, "label": "8002 Qwen3.6 (具視覺, 最快)"},
     "8006": {"host": os.environ.get("LLM_HOST_VL", "127.0.0.1:8006"),
              "model": os.environ.get("LLM_MODEL_VL", "qwen3.8"),
-             "vision": True, "label": "8006 qwen3.8 (具視覺)"},
+             "vision": True, "label": "8006 qwen3.8 (具視覺, 較慢)"},
 }
 PE_SYSTEM_PROMPTS = {
     "t2i": "/workspace/ComfyUI/pe/prompts/system_prompt_t2i.txt",
@@ -57,23 +57,18 @@ PE_SYSTEM_PROMPTS = {
 # 官方 PE 模型的呼叫路徑 (call_pe / pe_server.py) 保留於程式中，
 # 但不列入選單：實測本機端點快 8~10 倍且零額外資源，PE 服務已停用。
 PE_BACKENDS = {
-    "⚡ 自動 (文生圖用 8002，改圖用 8006)": "auto",
-    "8002 Qwen3.6 (純文字, 最快)": "8002",
-    "8006 qwen3.8 (具視覺)": "8006",
+    "8002 Qwen3.6 (具視覺, 最快)": "8002",
+    "8006 qwen3.8 (具視覺, 較慢)": "8006",
 }
-DEFAULT_PE_BACKEND = "⚡ 自動 (文生圖用 8002，改圖用 8006)"
+DEFAULT_PE_BACKEND = "8002 Qwen3.6 (具視覺, 最快)"
 
 
 def pick_endpoint(backend, task):
     """依後端選擇與任務決定端點。回傳 (key, config, 錯誤訊息)。"""
     need_vision = (task == "edit")
-    if backend == "auto":
-        key = "8006" if need_vision else "8002"
-        return key, LLM_ENDPOINTS[key], None
     cfg = LLM_ENDPOINTS[backend]
     if need_vision and not cfg["vision"]:
-        return backend, cfg, (
-            f"⚠️ {cfg['label']} 不支援影像輸入，改圖模式請改選 8006 或「⚡ 自動」。")
+        return backend, cfg, f"⚠️ {cfg['label']} 不支援影像輸入，改圖模式請改選其他後端。"
     return backend, cfg, None
 
 # 官方 PE 回傳的 wh_ratio -> 本 UI 尺寸選項
@@ -1200,7 +1195,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             if not imgs:
                 return gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
 
-        backend = PE_BACKENDS.get(backend_label, "auto")
+        backend = PE_BACKENDS.get(backend_label, "8002")
         endpoint = None
         if backend != "pe":
             _key, endpoint, warn = pick_endpoint(backend, task)
