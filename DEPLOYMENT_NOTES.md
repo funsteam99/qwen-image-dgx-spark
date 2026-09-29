@@ -41,6 +41,7 @@
 透過 Tailscale 網路（目標 IP: `<DGX_HOST>` / `<DGX_HOSTNAME>`）進行遠端實況盤查：
 1. **多模型佔用實況**：
    * `qwen3.6-nvfp4`（Port 8002）：鎖定 15GB KV-Cache，實際佔用約 **39.5 GiB** 記憶體。
+     （已停止；8002 現由 llama.cpp 服務接手，見第 15 節）
    * `qwen3.8-nvfp4`（Port 8006）：鎖定 10.7GB KV-Cache，實際佔用約 **37.5 GiB** 記憶體。
    * 其他服務：LiteLLM Gateway (Port 4000)、Hermes Agent (Port 9118)、本地桌面 Chromium 等。
 2. **記憶體餘裕警訊**：
@@ -226,7 +227,7 @@
 ## 5. 總結與維運守則
 
 1. **資源互斥維護**：
-   * 目前暫停的 `qwen3.6-nvfp4`（Port 8002）可視業務需要隨時透過 `docker start qwen3.6-nvfp4` 喚醒；但在 DGX Spark 記憶體滿載時，建議不同時對 Qwen-Image 進行大批次並發推論。
+   * 已停止的 `qwen3.6-nvfp4` 容器**不可再啟動**：8002 已改由 llama.cpp 服務使用（見第 15 節），兩者會搶同一個 port；但在 DGX Spark 記憶體滿載時，建議不同時對 Qwen-Image 進行大批次並發推論。
 2. **服務重啟與維護指令**：
    ```bash
    # 查看當前運行容器
@@ -532,6 +533,7 @@ UI 顯示 seed 為官方值，實際送出的卻是 `-1`。
    - 讀錯欄位名：此服務使用 `reasoning`，非 `reasoning_content`
 
    **關鍵設定：`chat_template_kwargs: {"enable_thinking": false}`。**
+   （2026-09-29 重測：8002、8006 開 thinking 皆不再截斷，見第 16 節。改寫仍維持關閉以求速度。）
 
 ### 11.3 實測對照（官方 system prompt，官方 parse_answer 規則）
 | 任務 | 本機 LLM (8006) | 官方 PE 模型 |
@@ -665,13 +667,13 @@ docker exec -d qwen-image-comfyui sh -c   'cd /workspace/ComfyUI/pe && python3 p
 ### 14.1 兩個本機端點，能力不同
 | 端點 | 模型 | 視覺 | 文生圖改寫 | 備註 |
 | :--- | :--- | :---: | ---: | :--- |
-| **8002** | `Qwen3.6-35B-A3B-abliterated.i1-Q4_K_M.gguf`（llama.cpp） | ❌ | **約 5 秒** | 無 mmproj，送圖回 `HTTP 500: image input is not supported` |
+| **8002** | `Qwen3.6-35B-A3B-abliterated.i1-Q4_K_M.gguf`（llama.cpp） | ❌（09-24 起 ✅，見第 15 節） | **約 5 秒** | 當時無 mmproj，送圖回 `HTTP 500: image input is not supported` |
 | **8006** | `qwen3.8-27B-NVFP4`（vLLM） | ✅ | 22~31 秒 | 改圖改寫 17.6 秒 |
 
 注意 8002 **並非**先前已停止的 `qwen3.6-nvfp4` 容器，是另一個 llama.cpp 服務，
 且其 `/v1/models` 回傳 `{"models": [...]}` 而非 OpenAI 標準的 `{"data": [...]}`。
 
-### 14.2 分流設計
+### 14.2 分流設計（已於 09-24 取消，見第 15 節）
 `pick_endpoint(backend, task)` 依任務選擇端點，選單三項：
 - `⚡ 自動`（預設）：文生圖 → 8002 取其速度；改圖／多圖 → 8006（唯一具視覺能力者）
 - `8002` / `8006`：手動指定。選 8002 而任務需要視覺時，回傳明確提示而非送出去踩 500。
@@ -693,3 +695,38 @@ docker exec -d qwen-image-comfyui sh -c   'cd /workspace/ComfyUI/pe && python3 p
 
 **教訓**：改用非官方推論後端時，官方的**取樣參數**與 system prompt 同等重要，
 不可只搬 prompt。
+
+---
+
+## 15. 【2026-09-24】8002 加掛 mmproj：兩端點皆具視覺，取消自動分流
+
+### 15.1 現況
+| 端點 | 模型 | 推論引擎 | 視覺 | 文生圖改寫 | 角色 |
+| :--- | :--- | :--- | :---: | ---: | :--- |
+| **8002** | `Qwen3.6-35B-A3B-abliterated.i1-Q4_K_M.gguf` + mmproj | llama.cpp | ✅ | 約 5~8 秒 | **預設** |
+| **8006** | `unsloth/Qwen3.8-27B-NVFP4` | vLLM | ✅ | 22~31 秒（改圖 17.6 秒） | 手動切換備用 |
+
+- 8002 **確定為 llama.cpp 服務**，與已停止的 `qwen3.6-nvfp4` 容器無關，該容器不可再啟動（會搶 port）。
+- 官方 PE 服務（8200）維持停用，程式碼保留（見 13.3）。
+
+### 15.2 前端調整
+- 第 14.2 節的「⚡ 自動」分流已移除：兩端點都能看圖，分流失去意義。
+- 選單只剩 `8002` / `8006` 兩項，預設固定 8002（`DEFAULT_PE_BACKEND`），由使用者視需要手動切換。
+- 兩者速度與擴寫品質仍有差異，未做系統性比較。
+
+---
+
+## 16. 【2026-09-29】thinking 截斷問題已不再發生（重測）
+
+第 11.2 節「thinking 吃光 max_tokens、無輸出」與第 14.3 節「未關 thinking 98 秒」為舊環境結果。
+以 `max_tokens=8192`、中文分鏡 JSON 任務重測：
+
+| 端點 | thinking 開 | thinking 關 | 截斷 | JSON |
+| :--- | ---: | ---: | :---: | :--- |
+| 8002 llama.cpp | 約 28 秒（思考約 5.5k 字） | **3.9 秒** | 無 | 皆為乾淨 JSON |
+| 8006 vLLM | 40~52 秒 | 13.6 秒 | 無 | 皆為乾淨 JSON |
+
+- 思考內容與答案分開回傳（`reasoning_content`），`finish_reason=stop`，答案完整。
+- 本專案 prompt 改寫仍維持 `enable_thinking=false`：轉換型任務不需推理，關閉快 7 倍。
+- 8006 的 API 模型名稱是 served name **`qwen3.8`**，不是權重名 `unsloth/Qwen3.8-27B-NVFP4`（用後者會 404）。
+
