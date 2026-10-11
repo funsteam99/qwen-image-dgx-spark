@@ -28,8 +28,19 @@ WEIGHT_PRESETS = {
         "qwen_image_2.1_int8_convrot.safetensors", "qwen3vl_8b_int8_convrot.safetensors"),
     "bf16 (最高保真，佔用約 30GB)": (
         "qwen_image_2.1_bf16.safetensors", "qwen3vl_8b_bf16.safetensors"),
+    # Turbo (2026-10-09)：同一個 7B 模型蒸餾成 8 步、CFG 1，文字編碼器與 VAE 與 2.1 共用。
+    "turbo int8 (8 步加速版，省記憶體)": (
+        "qwen_image_2.1_turbo_int8_convrot.safetensors", "qwen3vl_8b_int8_convrot.safetensors"),
+    "turbo bf16 (8 步加速版)": (
+        "qwen_image_2.1_turbo_bf16.safetensors", "qwen3vl_8b_int8_convrot.safetensors"),
 }
-DEFAULT_PRECISION = "int8 (官方模板預設，快且省記憶體)"
+# Turbo 的 8 步排程寫在權重裡，官方未評估其他排程；以 ManualSigmas 原樣送入。
+TURBO_SIGMAS = "1.0, 0.978453, 0.95418, 0.926626, 0.89508, 0.845148, 0.704534, 0.414568, 0.0"
+
+
+def is_turbo(precision):
+    return "turbo" in WEIGHT_PRESETS.get(precision, ("",))[0]
+DEFAULT_PRECISION = "turbo int8 (8 步加速版，省記憶體)"
 PE_HOST = "127.0.0.1:8200"   # 官方 Prompt Enhancer 常駐服務 (pe/pe_server.py)
 
 # --- Prompt 改寫後端 ---------------------------------------------------------
@@ -477,6 +488,25 @@ def send_to_comfy(
             "denoise": actual_denoise
         }
     }
+    if is_turbo(precision):
+        # Turbo：固定官方 8 步 sigmas 與 CFG 1，忽略步數/CFG 滑桿。
+        workflow["20"] = {"class_type": "ManualSigmas", "inputs": {"sigmas": TURBO_SIGMAS}}
+        workflow["21"] = {"class_type": "KSamplerSelect", "inputs": {"sampler_name": "euler"}}
+        workflow["6"] = {
+            "class_type": "SamplerCustom",
+            "inputs": {
+                "model": ["9", 0],
+                "add_noise": True,
+                "noise_seed": workflow["6"]["inputs"]["seed"],
+                "cfg": 1.0,
+                "positive": ["4", 0],
+                "negative": ["4", 1],
+                "sampler": ["21", 0],
+                "sigmas": ["20", 0],
+                "latent_image": latent_source,
+            }
+        }
+        steps = 8
     workflow["7"] = {
         "class_type": "VAEDecode",
         "inputs": {
@@ -505,7 +535,7 @@ def send_to_comfy(
     # 送出不等結果：結果由背景執行緒收，紀錄照寫，關掉分頁也不會漏。
     meta = {
         "mode": mode,
-        "seed": workflow["6"]["inputs"]["seed"],
+        "seed": workflow["6"]["inputs"].get("seed", workflow["6"]["inputs"].get("noise_seed")),
         "steps": int(steps),
         "precision": unet_name,
         "was_rewritten": was_rewritten,
@@ -1404,6 +1434,18 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
         )
         seed = gr.Number(value=-1, label="隨機種子 (Seed, -1 為隨機)", precision=0)
 
+        def on_precision_change(p):
+            # Turbo 的步數與 CFG 由權重決定，滑桿顯示實際值並鎖定，避免誤以為可調。
+            if is_turbo(p):
+                return (gr.update(minimum=1, value=8, interactive=False,
+                                  label="推論步數 (Turbo 固定 8 步)"),
+                        gr.update(value=1.0, interactive=False))
+            return (gr.update(minimum=15, value=40, interactive=True,
+                              label="推論步數 (官方 README: num_inference_steps=40)"),
+                    gr.update(interactive=True))
+        precision.change(on_precision_change, inputs=precision, outputs=[steps, cfg])
+        demo.load(on_precision_change, inputs=precision, outputs=[steps, cfg])
+
     with gr.Accordion("🕘 回看 (生成紀錄)", open=False):
         with gr.Row():
             hist_limit = gr.Number(value=10, precision=0, label="顯示最近幾筆", scale=1)
@@ -1546,7 +1588,8 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             inputs=[],
             outputs=_demo_outputs,
             queue=False
-        )
+        ).then(on_precision_change, inputs=precision, outputs=[steps, cfg], queue=False)
+        # 範例寫死 40 步；選 Turbo 時再依精度覆寫回 8 步並鎖定。
 
     def enhance_prompt(m, orig_text, editor_data, refs, sd, backend_label):
         """官方 Prompt Enhancer：拿「原始提示詞」欄位當下的內容去改寫，
