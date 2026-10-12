@@ -746,3 +746,4 @@ docker exec -d qwen-image-comfyui sh -c   'cd /workspace/ComfyUI/pe && python3 p
 - 長邊上限：iOS/iPadOS **1280**，其他裝置 2048。1280 已在 iPhone 實測成功。
 - 另外安裝 `pillow-heif` 並在程式開頭註冊，伺服器端可讀 HEIC（事後確認不是本次主因，保留作為保險）。容器已 `docker commit` 回 `qwen-image-studio:latest`；`app/Dockerfile`（與主機同步）也已把 `pillow-heif` 加進 pip install。
 - 除錯記錄程式已移除。
+- `app/ComfyUI/requirements.txt`：從主機 `~/qwen-image/ComfyUI/requirements.txt` 同步（ComfyUI upstream commit `b0f4b7b`），路徑與 Dockerfile 的 `COPY ComfyUI/requirements.txt` 對應。注意：Dockerfile 只用它來安裝套件，ComfyUI 程式本體與模型仍需在主機 `~/qwen-image` 掛載（docker-compose 的 volume），repo 不含。
