@@ -11,19 +11,16 @@
 - 主機上的 Docker 執行兩個容器：
   - `qwen-image-comfyui`：生圖引擎（:8188）
   - `qwen-gradio-ui`：網頁介面（:7860，經 Tailscale Serve 對外為 `https://<tailnet 主機名>:8443`）
-- 容器透過 docker-compose 的 volume **掛載**主機的 `~/qwen-image/`，程式碼不打包進映像。改主機上的 `gradio_app.py` 後重啟容器即生效，不需重新 build。
+- 兩個容器都用 volume **掛載**主機資料夾，程式碼不打包進映像：`qwen-image-comfyui` 由 docker-compose 啟動，掛 `~/qwen-image/ComfyUI`；`qwen-gradio-ui` 是另外用 `docker run` 建立的（不在 compose 裡），掛整個 `~/qwen-image`。改主機上的 `gradio_app.py` 後重啟容器即生效，不需重新 build。
 - 映像 `qwen-image-studio:latest` 只裝 Python 套件（gradio、torch、pillow-heif 等），由 `Dockerfile` + `ComfyUI/requirements.txt` 建置。
 
 **本 repo（本機 Windows / GitHub）：備份與紀錄**
 - `app/` 是主機上重要檔案的副本（程式、Dockerfile、compose、requirements），加上本筆記。本機不跑 Docker、沒有模型。
-- repo 裡的檔案不會被執行，也不影響主機上正在跑的服務；用途是留紀錄，主機故障或換機時可依此重建。
-- 主機的 `~/qwen-image` 不是 git repo，兩邊**不會自動同步**。改動流程：
-
-```
-1. SSH 到主機改檔 → 重啟容器 → 服務立即生效
-2. 把改好的檔案複製回本 repo 的 app/
-3. 在本機 commit → push 到 GitHub
-```
+- repo 本身不會被執行；只有經同步腳本上傳到主機的檔案才會影響服務。用途是留紀錄，主機故障或換機時可依此重建。
+- 主機的 `~/qwen-image` 不是 git repo，兩邊**不會自動同步**，兩個方向都有：
+  - **本機 → 主機**：在本機改 `app/gradio_app.py`，執行 `scripts\sync_code_to_dgx.bat`（scp 上傳 + 重啟 `qwen-gradio-ui`），再 commit / push。
+  - **主機 → 本機**：直接在主機改檔（例如 SSH 除錯時），事後 scp 回本 repo 的 `app/` 再 commit / push。
+  - 兩邊都改過時要先比對，避免互相覆蓋。
 
 ---
 
