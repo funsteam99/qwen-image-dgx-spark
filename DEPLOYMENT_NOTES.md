@@ -730,3 +730,19 @@ docker exec -d qwen-image-comfyui sh -c   'cd /workspace/ComfyUI/pe && python3 p
 - 本專案 prompt 改寫仍維持 `enable_thinking=false`：轉換型任務不需推理，關閉快 7 倍。
 - 8006 的 API 模型名稱是 served name **`qwen3.8`**，不是權重名 `unsloth/Qwen3.8-27B-NVFP4`（用後者會 404）。
 
+
+## 17. 【2026-10-12】iPhone 手機上傳主圖失敗：ImageEditor 畫布過大使分頁崩潰
+
+**症狀**：iPhone Chrome 透過 `https://<tailnet 主機名>:8443`（Tailscale Serve → :7860）上傳相機照片到主圖編輯區，圖片閃現後整頁重載、圖片消失；從「檔案」選 1024×1024 生成圖則正常。
+
+**排查過程**：
+- 必須用 Tailscale 主機名稱連線；用 IP 連 8443 時 TLS 憑證不符，連不上。
+- 伺服器端 `/gradio_api/upload` 正常，問題全在手機端。
+- 暫時在頁面注入除錯記錄（經 upload API / `sendBeacon` 把事件回傳伺服器）後確認：iOS 送出的是 JPEG（3024×4032，1.46 MB），不是 HEIC；縮到 1536×2048 交給 Gradio 後約 1 秒分頁仍崩潰重載。
+- 結論：Gradio `ImageEditor` 在 iPhone 上建立的畫布超過 iOS 記憶體／canvas 上限（推測與 devicePixelRatio=3 有關），WebKit 直接殺掉分頁重載。
+
+**修正**（`gradio_app.py` 的 `paste_helper_script`）：
+- 攔截所有 `input[type=file]` 的 `change`，在 Gradio 收到檔案前於瀏覽器端縮圖並轉 JPEG。
+- 長邊上限：iOS/iPadOS **1280**，其他裝置 2048。1280 已在 iPhone 實測成功。
+- 另外安裝 `pillow-heif` 並在程式開頭註冊，伺服器端可讀 HEIC（事後確認不是本次主因，保留作為保險）。容器已 `docker commit` 回 `qwen-image-studio:latest`；主機上的 Dockerfile 也已把 `pillow-heif` 加進 pip install。
+- 除錯記錄程式已移除。

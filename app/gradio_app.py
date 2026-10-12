@@ -1,4 +1,9 @@
 import gradio as gr
+try:
+    from pillow_heif import register_heif_opener
+    register_heif_opener()  # iPhone HEIC/HEIF 照片支援
+except ImportError:
+    pass
 import urllib.request
 import urllib.error
 import json
@@ -1772,6 +1777,50 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
 # 注入針對不同區域的精準貼上偵測指令碼
 paste_helper_script = """
 <script>
+// 手機大照片 / HEIC：iOS 的 canvas 有約 1677 萬像素上限，24MP/48MP 照片會讓上傳元件靜默失敗。
+// 在 Gradio 收到檔案前先縮圖並轉成 JPEG：iOS 長邊 1280（ImageEditor 在 iPhone 上 1536x2048 就會讓分頁崩潰重載），其他 2048。
+const MAX_SIDE = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent)) ? 1280 : 2048;
+function needsShrink(f) {
+    return f && /^image\/|\.(heic|heif)$/i.test(f.type || f.name) && !/gif|svg/i.test(f.type);
+}
+async function shrinkImage(f) {
+    const url = URL.createObjectURL(f);
+    try {
+        const img = new Image();
+        img.src = url;
+        await img.decode();
+        const w = img.naturalWidth, h = img.naturalHeight;
+        const isHeic = /heic|heif/i.test(f.type) || /\.(heic|heif)$/i.test(f.name);
+        if (Math.max(w, h) <= MAX_SIDE && !isHeic) return f;
+        const k = Math.min(1, MAX_SIDE / Math.max(w, h));
+        const c = document.createElement('canvas');
+        c.width = Math.round(w * k); c.height = Math.round(h * k);
+        c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
+        const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+        if (!blob) return f;
+        return new File([blob], f.name.replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' });
+    } catch (err) {
+        console.warn('shrinkImage failed, sending original', String(err));
+        return f;
+    } finally {
+        URL.revokeObjectURL(url);
+    }
+}
+document.addEventListener('change', async (e) => {
+    const input = e.target;
+    if (!(input instanceof HTMLInputElement) || input.type !== 'file') return;
+    if (input.dataset.shrunk === '1') { delete input.dataset.shrunk; return; }
+    const files = Array.from(input.files || []);
+    if (!files.some(needsShrink)) return;
+    e.stopImmediatePropagation();
+    const out = [];
+    for (const f of files) out.push(needsShrink(f) ? await shrinkImage(f) : f);
+    const dt = new DataTransfer();
+    out.forEach(f => dt.items.add(f));
+    input.files = dt.files;
+    input.dataset.shrunk = '1';
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+}, true);
 window.lastHoverBox = 'main';
 
 document.addEventListener('mouseover', (e) => {
