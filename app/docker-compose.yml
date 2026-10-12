@@ -24,3 +24,15 @@ services:
     #   造成權重雙倍佔用，128GB 實際只能當 64GB 用。
     # --disable-pinned-memory: 統一記憶體下 pinned memory 無益處。
     command: python3 main.py --listen 0.0.0.0 --port 8188 --highvram --disable-mmap --disable-pinned-memory
+
+  # 網頁介面 (Gradio :7860)。原本是 2026-09-21 手動 docker run 建立，2026-10-12 併入 compose。
+  # 掛載整個 qwen-image 資料夾：gradio_app.py、generation_history.jsonl、ComfyUI/output|input 都從這裡讀寫。
+  qwen-gradio:
+    image: qwen-image-studio:latest
+    container_name: qwen-gradio-ui
+    restart: always
+    network_mode: host
+    volumes:
+      - ${QWEN_IMAGE_HOST_PATH:-/home/youruser/qwen-image}:/workspace
+    working_dir: /workspace
+    command: python3 gradio_app.py

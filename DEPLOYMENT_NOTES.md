@@ -11,7 +11,7 @@
 - 主機上的 Docker 執行兩個容器：
   - `qwen-image-comfyui`：生圖引擎（:8188）
   - `qwen-gradio-ui`：網頁介面（:7860，經 Tailscale Serve 對外為 `https://<tailnet 主機名>:8443`）
-- 兩個容器都用 volume **掛載**主機資料夾，程式碼不打包進映像：`qwen-image-comfyui` 由 docker-compose 啟動，掛 `~/qwen-image/ComfyUI`；`qwen-gradio-ui` 是另外用 `docker run` 建立的（不在 compose 裡），掛整個 `~/qwen-image`。改主機上的 `gradio_app.py` 後重啟容器即生效，不需重新 build。
+- 兩個容器都用 volume **掛載**主機資料夾，程式碼不打包進映像：兩者都由 `docker-compose.yml` 管理（`qwen-gradio-ui` 於 2026-10-12 併入，之前是手動 `docker run`）；`qwen-image-comfyui` 掛 `~/qwen-image/ComfyUI`，`qwen-gradio-ui` 掛整個 `~/qwen-image`。改主機上的 `gradio_app.py` 後重啟容器即生效，不需重新 build。
 - 映像 `qwen-image-studio:latest` 只裝 Python 套件（gradio、torch、pillow-heif 等），由 `Dockerfile` + `ComfyUI/requirements.txt` 建置。
 
 **本 repo（本機 Windows / GitHub）：備份與紀錄**
@@ -21,6 +21,40 @@
   - **本機 → 主機**：在本機改 `app/gradio_app.py`，執行 `scripts\sync_code_to_dgx.bat`（scp 上傳 + 重啟 `qwen-gradio-ui`），再 commit / push。
   - **主機 → 本機**：直接在主機改檔（例如 SSH 除錯時），事後 scp 回本 repo 的 `app/` 再 commit / push。
   - 兩邊都改過時要先比對，避免互相覆蓋。
+
+---
+
+## 安裝步驟（從零重建用）
+
+> 當初安裝的實際指令沒有留下紀錄；以下是 2026-10-12 依主機現況（映像歷史、容器設定、目錄結構）反推整理的步驟。
+
+1. **取得 ComfyUI 程式**
+   ```bash
+   mkdir -p ~/qwen-image && cd ~/qwen-image
+   git clone https://github.com/comfyanonymous/ComfyUI.git
+   ```
+2. **放入本 repo 的檔案**：把 `app/gradio_app.py`、`app/Dockerfile`、`app/docker-compose.yml` 複製到 `~/qwen-image/`。`app/ComfyUI/requirements.txt` 是當時 ComfyUI 版本（`b0f4b7b`）的套件清單，如需完全相同版本可覆蓋過去。
+3. **Build 映像**（基底 `nvcr.io/nvidia/pytorch:25.11-py3`，已支援 ARM64 + Blackwell；裝 ComfyUI 套件、gradio、pillow-heif，並移除會衝突的 torchaudio，見 3.2 節）
+   ```bash
+   cd ~/qwen-image
+   docker build -t qwen-image-studio:latest .
+   ```
+4. **下載模型**（Hugging Face `Comfy-Org/Qwen-Image-2.1`，見 3.3 節）到 `~/qwen-image/ComfyUI/models/`：
+   - `diffusion_models/`：`qwen_image_2.1_bf16`、`qwen_image_2.1_int8_convrot`、`qwen_image_2.1_turbo_bf16`、`qwen_image_2.1_turbo_int8_convrot`（`.safetensors`）
+   - `text_encoders/`：`qwen3vl_8b_bf16`、`qwen3vl_8b_int8_convrot`
+   - `vae/`：`qwen_image_2.1_vae_bf16`
+5. **啟動兩個服務**：repo 版 compose 的路徑用環境變數（預設是 `/home/youruser/...` 佔位），請先設好再啟動：
+   ```bash
+   export COMFYUI_HOST_PATH=~/qwen-image/ComfyUI QWEN_IMAGE_HOST_PATH=~/qwen-image
+   docker compose up -d
+   ```
+   - `qwen-image-comfyui`：ComfyUI :8188
+   - `qwen-gradio-ui`：Gradio :7860（2026-10-12 起寫進 compose；之前是手動 `docker run`）
+6. **HTTPS（手機用）**：用 Tailscale Serve 把 :8443 轉到 :7860，連線一律用 tailnet 主機名稱（用 IP 憑證不符，見第 17 節）
+   ```bash
+   tailscale serve --bg --https=8443 http://127.0.0.1:7860
+   ```
+7. **LLM 改寫端點**（選用）：`gradio_app.py` 預設連 `127.0.0.1:8002`（llama.cpp）與 `127.0.0.1:8006`（vLLM，模型名 `qwen3.8`），可用環境變數 `LLM_HOST_TEXT`、`LLM_HOST_VL`、`LLM_MODEL_VL` 改。這兩個服務不在本 compose 內。
 
 ---
 
