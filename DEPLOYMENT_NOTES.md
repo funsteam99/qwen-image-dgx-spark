@@ -4,6 +4,29 @@
 
 ---
 
+## 先讀這裡：DGX Spark 主機與本 repo 的關係
+
+**DGX Spark 主機：服務實際執行的地方**
+- `~/qwen-image/` 是實際使用的資料夾，裡面有 `gradio_app.py`、`Dockerfile`、`docker-compose.yml`、ComfyUI 程式本體與模型（數十 GB）。
+- 主機上的 Docker 執行兩個容器：
+  - `qwen-image-comfyui`：生圖引擎（:8188）
+  - `qwen-gradio-ui`：網頁介面（:7860，經 Tailscale Serve 對外為 `https://<tailnet 主機名>:8443`）
+- 容器透過 docker-compose 的 volume **掛載**主機的 `~/qwen-image/`，程式碼不打包進映像。改主機上的 `gradio_app.py` 後重啟容器即生效，不需重新 build。
+- 映像 `qwen-image-studio:latest` 只裝 Python 套件（gradio、torch、pillow-heif 等），由 `Dockerfile` + `ComfyUI/requirements.txt` 建置。
+
+**本 repo（本機 Windows / GitHub）：備份與紀錄**
+- `app/` 是主機上重要檔案的副本（程式、Dockerfile、compose、requirements），加上本筆記。本機不跑 Docker、沒有模型。
+- repo 裡的檔案不會被執行，也不影響主機上正在跑的服務；用途是留紀錄，主機故障或換機時可依此重建。
+- 主機的 `~/qwen-image` 不是 git repo，兩邊**不會自動同步**。改動流程：
+
+```
+1. SSH 到主機改檔 → 重啟容器 → 服務立即生效
+2. 把改好的檔案複製回本 repo 的 app/
+3. 在本機 commit → push 到 GitHub
+```
+
+---
+
 ## 目錄
 1. [起點：需求分析與初始方案](#1-起點需求分析與初始方案)
 2. [探勘：DGX Spark 實機規格與生態盤點](#2-探勘dgx-spark-實機規格與生態盤點)
