@@ -801,3 +801,29 @@ docker exec -d qwen-image-comfyui sh -c   'cd /workspace/ComfyUI/pe && python3 p
 - 另外安裝 `pillow-heif` 並在程式開頭註冊，伺服器端可讀 HEIC（事後確認不是本次主因，保留作為保險）。容器已 `docker commit` 回 `qwen-image-studio:latest`；`app/Dockerfile`（與主機同步）也已把 `pillow-heif` 加進 pip install。
 - 除錯記錄程式已移除。
 - `app/ComfyUI/requirements.txt`：從主機 `~/qwen-image/ComfyUI/requirements.txt` 同步（ComfyUI upstream commit `b0f4b7b`），路徑與 Dockerfile 的 `COPY ComfyUI/requirements.txt` 對應。注意：Dockerfile 只用它來安裝套件，ComfyUI 程式本體與模型仍需在主機 `~/qwen-image` 掛載（docker-compose 的 volume），repo 不含。
+
+
+## 18. 【2026-10-15】iPhone 上傳一直斷線、頁面重載：Gradio 讓 ImageEditor 不斷重傳整張圖
+
+**症狀**：iPhone 上傳照片到主圖後，頁面有時整頁重載、圖片消失；按「生成」後要等好幾秒工作才送出。`qwen-gradio-ui` 的 log 有上千筆 `starlette.requests.ClientDisconnect`（都在 `upload_file`）。
+
+**根因**（Gradio 6 核心行為，6.28～6.30 與 main `c270f35` 皆同，GitHub 無人回報）：
+- 元件只要當過任何已執行事件的輸入或輸出，就會被列入前端的 loading status 清單（`js/statustracker/static/state.svelte.ts`）。
+- 之後**任何**事件狀態一變（排隊、執行、完成），`dependency.ts` 的 `update_loading_stati_state()` 就對清單中每個元件呼叫 `update_state`；更新不帶 `value`，於是先 `get_data` 取一次現值。
+- `ImageEditor` 的 `get_data` 會把背景、合成圖、圖層**全部重新上傳**。iPhone 照片縮圖後約 1.2 MB ×2，一輪約 2.4 MB。
+- 原本佇列狀態用 `gr.Timer(3)`，每 3 秒產生數個狀態變化 → 閒置時也無限重傳；按生成時十幾秒內排了約 40 個 1.2 MB 上傳，手機傳不完就一起斷線、分頁重載。電腦上傳得快所以看不出來。
+- 排除的猜測：不是沒走 HTTPS（照片確實經 HTTPS 送達）、不是重複點擊、不是 iPhone 專屬（電腦 Chrome 模擬手機尺寸也能重現）。
+- 第 17 節的「畫布過大使分頁崩潰」可能部分也是這個原因造成，當時未察覺。
+
+**修正**（`gradio_app.py`，commit `939bde5`）：
+- 拿掉 `gr.Timer`；佇列狀態改由頁面 JS 每 3 秒呼叫 `GET /queue_view`（ASGI middleware 提供，不經 Gradio 事件），頁面隱藏時暫停；按生成後 1～4.5 秒內額外更新。新完成的結果圖由 JS 寫入隱藏的 `result_bridge_id` 並點 `result_bridge_btn` 載入（伺服器只接受 JOBS 內已完成的 id，不接受路徑）。本頁的 job id 由生成按鈕的 `.then` 寫入隱藏的 `my_jobs_box`。
+- 頁面 JS 攔截 `/gradio_api/upload`：同一檔案（SHA-1＋大小＋檔名）10 分鐘內只真的上傳一次，之後直接回傳上次的伺服器路徑；同時進行中的相同上傳共用一個請求。`crypto.subtle` 只在 HTTPS 可用，走 HTTP 時不去重。
+- 選照片縮圖期間顯示「照片處理中，請稍候…」遮罩。
+- 結果（iPhone 實測，放照片→按生成）：主圖上傳約 80 次→3 次；按下到工作送出 10 秒以上→1 秒內；無斷線。
+
+**注意**：不要再加 `gr.Timer` 或其他頻繁觸發的 Gradio 事件，否則重傳問題會回來；需要輪詢就走自訂路由。
+
+**常駐診斷紀錄**（`docker logs qwen-gradio-ui`）：
+- `[UPLOAD start]` / `[UPLOAD end]`：每個上傳請求的來源（`via=tailscale-serve(https)` / `direct(http)` / `localhost`）、Tailscale 使用者、宣告大小與實收位元組、是否斷線、耗時、User-Agent。
+- `[CLIENT]`（commit `389c126`）：選照片的每一步 `picked` → `decoded` → `shrunk` → `handed` → `done`（交給 Gradio 後撐過 8 秒）。每步先寫入 localStorage，分頁被 iOS 收掉時，下次載入的 `page_load` 會帶 `prev_step`，顯示上一頁停在哪一步。停在 `picked` 表示解碼時當掉，停在 `handed` 表示 ImageEditor 繪製時出事。
+- 今天另有一次選照片後重載、照片未送達伺服器，事後同一張照片（12MP JPEG，3.8 MB，解碼 0.1 秒）無法重現，原因未明；再發生時看 `prev_step`。
