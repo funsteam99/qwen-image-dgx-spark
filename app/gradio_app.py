@@ -663,13 +663,16 @@ def _job_label(item):
     return "（非文字工作流）"
 
 
-def build_queue_view(my_jobs, last_shown):
-    """佇列狀態：整個 ComfyUI 佇列 + 7860 最近結束的工作；有新完成的就更新輸出區。"""
+def build_queue_view(my_jobs):
+    """佇列狀態：整個 ComfyUI 佇列 + 7860 最近結束的工作。回傳 (html, 本頁最新完成的 job id)。
+
+    由前端 JS 輪詢 /queue_view 呼叫，不走 Gradio 事件：Gradio 每個事件的狀態變化都會向
+    「曾參與事件的元件」重新取值，主圖 ImageEditor 每取一次值就把整張圖重新上傳一次。
+    """
     try:
         q = _comfy_json("/queue")
     except Exception as e:
-        return (f'<p style="color:#b91c1c">無法讀取 ComfyUI 佇列：{_esc(str(e))}</p>',
-                gr.update(), last_shown)
+        return f'<p style="color:#b91c1c">無法讀取 ComfyUI 佇列：{_esc(str(e))}</p>', None
     running = q.get("queue_running", [])
     pending = sorted(q.get("queue_pending", []), key=lambda it: it[0])
     mine = set(my_jobs or [])
@@ -701,16 +704,24 @@ def build_queue_view(my_jobs, last_shown):
                  "<th>提示詞</th><th style='width:50px'></th><th style='width:60px'></th></tr></thead>"
                  "<tbody>" + "".join(rows) + "</tbody></table>")
 
-    # 輸出區：這個頁面送出的工作裡，最新完成的那張
+    # 輸出區：這個頁面送出的工作裡，最新完成的那張（由前端決定是否載入）
     with JOBS_LOCK:
-        newest = next(((k, JOBS[k]["file"]) for k in reversed(my_jobs or [])
+        newest = next((k for k in reversed(my_jobs or [])
                        if k in JOBS and JOBS[k]["status"] == "done"), None)
-    if newest and newest[0] != last_shown:
-        try:
-            return html, Image.open(os.path.join(COMFY_OUTPUT_DIR, newest[1])), newest[0]
-        except Exception:
-            pass
-    return html, gr.update(), last_shown
+    return html, newest
+
+
+def load_job_result(job_id):
+    """輸出區載入指定工作的結果圖；只接受 JOBS 內已完成的 id，不接受前端傳路徑。"""
+    job_id = (job_id or "").strip()
+    with JOBS_LOCK:
+        job = dict(JOBS[job_id]) if job_id in JOBS else None
+    if not job or job["status"] != "done":
+        return gr.update()
+    try:
+        return Image.open(os.path.join(COMFY_OUTPUT_DIR, job["file"]))
+    except Exception:
+        return gr.update()
 
 
 # =============================================================================
@@ -1387,7 +1398,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 lines=1
             )
             
-            run_btn = gr.Button(RUN_BTN_LABEL, variant="primary", size="lg")
+            run_btn = gr.Button(RUN_BTN_LABEL, variant="primary", size="lg", elem_id="run_btn")
 
         with gr.Column(scale=4):
             output_img = gr.Image(
@@ -1398,13 +1409,17 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             )
             submit_status = gr.Markdown("")
             gr.Markdown("### 📋 佇列狀態（整個 ComfyUI 佇列，每 3 秒更新）")
-            queue_html = gr.HTML("<p>載入中…</p>")
+            # 內容由前端 JS 輪詢 /queue_view 填入（見 paste_helper_script），不用 gr.Timer
+            queue_html = gr.HTML('<div id="queue_view"><p>載入中…</p></div>')
             my_jobs = gr.State([])
-            last_shown = gr.State(None)
-            queue_timer = gr.Timer(3)
             with gr.Row(elem_classes=["hist-bridge"]):
                 cancel_bridge_id = gr.Textbox(elem_id="cancel_bridge_id", show_label=False)
                 cancel_bridge_btn = gr.Button("cancel", elem_id="cancel_bridge_btn")
+                # 本頁送出的 job id（逗號分隔），給前端輪詢用
+                my_jobs_box = gr.Textbox(elem_id="my_jobs_box", show_label=False)
+                # 前端發現新完成的工作時，寫入 id 並點按鈕把結果載入輸出區
+                result_bridge_id = gr.Textbox(elem_id="result_bridge_id", show_label=False)
+                result_bridge_btn = gr.Button("result", elem_id="result_bridge_btn")
 
     # 生成參數置於頁面最下方：平時不佔版面，需要時捲到底調整。
     # ⚠️ 必須保持展開：Gradio 6 的折疊 Accordion 不渲染子元件，
@@ -1766,17 +1781,56 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             my_jobs
         ],
         outputs=[my_jobs, submit_status]
-    )
+    ).then(fn=lambda j: ",".join(j or []), inputs=[my_jobs], outputs=[my_jobs_box], queue=False)
 
-    queue_timer.tick(fn=build_queue_view, inputs=[my_jobs, last_shown],
-                     outputs=[queue_html, output_img, last_shown], show_progress="hidden")
-    demo.load(fn=build_queue_view, inputs=[my_jobs, last_shown],
-              outputs=[queue_html, output_img, last_shown], show_progress="hidden")
     cancel_bridge_btn.click(fn=cancel_job, inputs=[cancel_bridge_id], queue=False)
+    result_bridge_btn.click(fn=load_job_result, inputs=[result_bridge_id], outputs=[output_img],
+                            queue=False, show_progress="hidden")
 
 # 注入針對不同區域的精準貼上偵測指令碼
 paste_helper_script = """
 <script>
+// 上傳去重：Gradio 每個事件的狀態變化都會向主圖 ImageEditor 重新取值，而它每取一次就把
+// 背景/合成/圖層整組重新上傳（iPhone 上一按生成就排了約 40 個 1.2MB 上傳）。
+// 同一個檔案（SHA-1 + 大小 + 檔名相同）10 分鐘內只真的上傳一次，之後直接回傳上次的伺服器路徑；
+// 同時進行中的相同上傳共用同一個請求。crypto.subtle 只在 HTTPS 可用，HTTP 下不去重。
+(() => {
+    if (!window.crypto || !crypto.subtle) return;
+    const TTL = 10 * 60 * 1000, MAX = 30;
+    const cache = new Map();  // key -> { t, text: Promise<string|null> }
+    const origFetch = window.fetch;
+    window.fetch = async function (input, init) {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        const body = init && init.body;
+        if (!url.includes('/gradio_api/upload') || !(body instanceof FormData)) {
+            return origFetch.apply(this, arguments);
+        }
+        const files = body.getAll('files');
+        if (files.length !== 1 || !(files[0] instanceof Blob)) return origFetch.apply(this, arguments);
+        const f = files[0];
+        let key;
+        try {
+            const digest = await crypto.subtle.digest('SHA-1', await f.arrayBuffer());
+            key = Array.from(new Uint8Array(digest), b => b.toString(16).padStart(2, '0')).join('')
+                + ':' + f.size + ':' + (f.name || '');
+        } catch (err) {
+            return origFetch.apply(this, arguments);
+        }
+        const hit = cache.get(key);
+        if (hit && Date.now() - hit.t < TTL) {
+            const text = await hit.text;
+            if (text !== null) {
+                return new Response(text, { status: 200, headers: { 'content-type': 'application/json' } });
+            }
+        }
+        const resp = origFetch.apply(this, arguments);
+        const entry = { t: Date.now(), text: resp.then(r => (r.ok ? r.clone().text() : null), () => null) };
+        cache.set(key, entry);
+        entry.text.then(text => { if (text === null && cache.get(key) === entry) cache.delete(key); });
+        while (cache.size > MAX) cache.delete(cache.keys().next().value);
+        return resp;
+    };
+})();
 // 手機大照片 / HEIC：iOS 的 canvas 有約 1677 萬像素上限，24MP/48MP 照片會讓上傳元件靜默失敗。
 // 在 Gradio 收到檔案前先縮圖並轉成 JPEG：iOS 長邊 1280（ImageEditor 在 iPhone 上 1536x2048 就會讓分頁崩潰重載），其他 2048。
 const MAX_SIDE = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent)) ? 1280 : 2048;
@@ -1813,8 +1867,17 @@ document.addEventListener('change', async (e) => {
     const files = Array.from(input.files || []);
     if (!files.some(needsShrink)) return;
     e.stopImmediatePropagation();
+    // 大照片解碼在 iPhone 上要好幾秒，沒提示會讓人以為沒反應而重複點選；顯示遮罩並擋住點擊
+    const busy = document.createElement('div');
+    busy.textContent = '照片處理中，請稍候…';
+    busy.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45);color:#fff;font-size:18px;';
+    document.body.appendChild(busy);
     const out = [];
-    for (const f of files) out.push(needsShrink(f) ? await shrinkImage(f) : f);
+    try {
+        for (const f of files) out.push(needsShrink(f) ? await shrinkImage(f) : f);
+    } finally {
+        busy.remove();
+    }
     const dt = new DataTransfer();
     out.forEach(f => dt.items.add(f));
     input.files = dt.files;
@@ -1859,6 +1922,46 @@ document.addEventListener('click', (e) => {
     box.dispatchEvent(new Event('input', { bubbles: true }));
     setTimeout(() => go.click(), 50);
 });
+
+// 佇列狀態：每 3 秒直接打 /queue_view，不用 gr.Timer。
+// Gradio 每個事件的狀態變化都會向主圖 ImageEditor 重新取值，而它每取一次就把整張圖重傳一次。
+let queueLastShown = null, queueBusy = false;
+async function pollQueue() {
+    if (queueBusy || document.hidden) return;
+    const view = document.getElementById('queue_view');
+    if (!view) return;
+    queueBusy = true;
+    try {
+        const box = document.querySelector('#my_jobs_box textarea, #my_jobs_box input');
+        const jobs = box ? box.value.trim() : '';
+        const r = await fetch('/queue_view?jobs=' + encodeURIComponent(jobs), { cache: 'no-store' });
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        const d = await r.json();
+        view.innerHTML = d.html;
+        if (d.newest && d.newest !== queueLastShown) {
+            queueLastShown = d.newest;
+            const idBox = document.querySelector('#result_bridge_id textarea, #result_bridge_id input');
+            const go = document.getElementById('result_bridge_btn');
+            if (idBox && go) {
+                idBox.value = d.newest;
+                idBox.dispatchEvent(new Event('input', { bubbles: true }));
+                setTimeout(() => go.click(), 50);
+            }
+        }
+    } catch (err) {
+        view.innerHTML = '<p style="color:#b91c1c">無法讀取佇列狀態：' + String(err).replace(/[<>&]/g, '') + '</p>';
+    } finally {
+        queueBusy = false;
+    }
+}
+setInterval(pollQueue, 3000);
+// 按下生成後不等下一輪，送出完成（約 1–4 秒）就更新
+document.addEventListener('click', (e) => {
+    if (!e.target.closest('#run_btn')) return;
+    [1000, 2500, 4500].forEach(ms => setTimeout(pollQueue, ms));
+}, true);
+document.addEventListener('visibilitychange', pollQueue);
+window.addEventListener('load', () => setTimeout(pollQueue, 500));
 
 // 過往圖片浮動視窗：捲到接近底部就自動「載入更多」（scroll 不冒泡，故用捕獲）
 let pickerMoreAt = 0;
@@ -1913,8 +2016,72 @@ window.addEventListener('paste', (e) => {
 </script>
 """
 
+class UploadLogMiddleware:
+    """純 ASGI middleware，負責兩件事：
+    1. 提供 GET /queue_view（佇列狀態輪詢，刻意不走 Gradio 事件）。
+    2. 記錄每個上傳請求的來源、裝置與大小（docker log 的 [UPLOAD 行），診斷上傳中斷用；
+       只包裝 receive 計算位元組數，不讀取或改動上傳內容。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "http" and scope.get("path") == "/queue_view" and scope.get("method") == "GET":
+            # 佇列狀態輪詢：刻意不走 Gradio 事件（理由見 build_queue_view）
+            import asyncio, re, urllib.parse
+            qs = urllib.parse.parse_qs(scope.get("query_string", b"").decode("latin-1"))
+            jobs = [j for j in (qs.get("jobs", [""])[0]).split(",") if re.fullmatch(r"[0-9a-fA-F-]{8,64}", j)]
+            html, newest = await asyncio.to_thread(build_queue_view, jobs[-50:])
+            body = json.dumps({"html": html, "newest": newest}).encode("utf-8")
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"application/json; charset=utf-8"),
+                                    (b"cache-control", b"no-store")]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        if scope["type"] != "http" or "upload" not in scope.get("path", ""):
+            return await self.app(scope, receive, send)
+
+        headers = {k.decode("latin-1").lower(): v.decode("latin-1") for k, v in scope.get("headers", [])}
+        client = scope.get("client") or ("?", 0)
+        # Tailscale Serve 轉發時來源是 127.0.0.1 並帶 X-Forwarded-For；直接連 :7860 則是手機的 tailnet IP
+        if "x-forwarded-for" in headers:
+            via = "tailscale-serve(https)"
+        elif client[0] in ("127.0.0.1", "::1"):
+            via = "localhost"
+        else:
+            via = "direct(http)"
+        info = (f"src={client[0]} via={via} xff={headers.get('x-forwarded-for', '-')} "
+                f"ts_user={headers.get('tailscale-user-login', '-')} "
+                f"len={headers.get('content-length', '-')} ua={headers.get('user-agent', '-')[:120]}")
+        state = {"bytes": 0, "disconnect": False, "status": None}
+        t0 = time.time()
+
+        async def counting_receive():
+            msg = await receive()
+            if msg["type"] == "http.request":
+                state["bytes"] += len(msg.get("body", b""))
+            elif msg["type"] == "http.disconnect":
+                state["disconnect"] = True
+            return msg
+
+        async def status_send(msg):
+            if msg["type"] == "http.response.start":
+                state["status"] = msg["status"]
+            await send(msg)
+
+        print(f"[UPLOAD start] {scope['method']} {scope['path']} {info}", flush=True)
+        try:
+            await self.app(scope, counting_receive, status_send)
+        finally:
+            print(f"[UPLOAD end] status={state['status']} received={state['bytes']} "
+                  f"disconnect={state['disconnect']} {time.time() - t0:.2f}s {info}", flush=True)
+
+
 if __name__ == "__main__":
+    from starlette.middleware import Middleware
     demo.queue(default_concurrency_limit=4)
     demo.launch(server_name="0.0.0.0", server_port=7860, share=False,
                 head=paste_helper_script,
-                allowed_paths=[COMFY_OUTPUT_DIR])
+                allowed_paths=[COMFY_OUTPUT_DIR],
+                app_kwargs={"middleware": [Middleware(UploadLogMiddleware)]})
