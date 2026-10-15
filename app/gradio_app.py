@@ -1833,6 +1833,30 @@ paste_helper_script = """
 })();
 // 手機大照片 / HEIC：iOS 的 canvas 有約 1677 萬像素上限，24MP/48MP 照片會讓上傳元件靜默失敗。
 // 在 Gradio 收到檔案前先縮圖並轉成 JPEG：iOS 長邊 1280（ImageEditor 在 iPhone 上 1536x2048 就會讓分頁崩潰重載），其他 2048。
+// 選照片流程紀錄：iPhone 選照片後頁面有時直接重載、照片沒送出。每一步先寫進 localStorage
+// （分頁被 iOS 收掉也留得住），下次載入頁面時把上一頁停在哪一步回報給 /client_log。
+const PHOTO_STEP_KEY = 'qwen_photo_step';
+function clientLog(obj) {
+    try {
+        navigator.sendBeacon('/client_log', JSON.stringify(Object.assign({
+            ua: (navigator.userAgent.match(/iPhone OS [\d_]+|Android [\d.]+|Windows NT [\d.]+|Mac OS X [\d_]+/) || ['?'])[0],
+            vw: innerWidth, vh: innerHeight
+        }, obj)));
+    } catch (err) {}
+}
+function photoStep(step, info) {
+    const rec = Object.assign({ step, t: Date.now() }, info || {});
+    try { localStorage.setItem(PHOTO_STEP_KEY, JSON.stringify(rec)); } catch (err) {}
+    clientLog(Object.assign({ ev: 'photo' }, rec));
+}
+(() => {
+    let prev = null;
+    try { prev = JSON.parse(localStorage.getItem(PHOTO_STEP_KEY) || 'null'); localStorage.removeItem(PHOTO_STEP_KEY); } catch (err) {}
+    const nav = (performance.getEntriesByType('navigation')[0] || {}).type || '-';
+    // prev.step 不是 done 就代表上一頁在處理照片途中消失（重載/當掉）
+    clientLog({ ev: 'page_load', nav, prev_step: prev && prev.step !== 'done' ? prev : null,
+                prev_age_s: prev ? Math.round((Date.now() - prev.t) / 1000) : null });
+})();
 const MAX_SIDE = /iPhone|iPad|iPod/.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Mac/.test(navigator.userAgent)) ? 1280 : 2048;
 function needsShrink(f) {
     return f && /^image\/|\.(heic|heif)$/i.test(f.type || f.name) && !/gif|svg/i.test(f.type);
@@ -1842,8 +1866,10 @@ async function shrinkImage(f) {
     try {
         const img = new Image();
         img.src = url;
+        const t0 = performance.now();
         await img.decode();
         const w = img.naturalWidth, h = img.naturalHeight;
+        photoStep('decoded', { w, h, ms: Math.round(performance.now() - t0) });
         const isHeic = /heic|heif/i.test(f.type) || /\.(heic|heif)$/i.test(f.name);
         if (Math.max(w, h) <= MAX_SIDE && !isHeic) return f;
         const k = Math.min(1, MAX_SIDE / Math.max(w, h));
@@ -1851,10 +1877,12 @@ async function shrinkImage(f) {
         c.width = Math.round(w * k); c.height = Math.round(h * k);
         c.getContext('2d').drawImage(img, 0, 0, c.width, c.height);
         const blob = await new Promise(r => c.toBlob(r, 'image/jpeg', 0.92));
+        photoStep('shrunk', { out: blob ? blob.size : null, cw: c.width, ch: c.height });
         if (!blob) return f;
         return new File([blob], f.name.replace(/\.[^.]+$/, '') + '.jpg', { type: 'image/jpeg' });
     } catch (err) {
         console.warn('shrinkImage failed, sending original', String(err));
+        photoStep('shrink_error', { err: String(err).slice(0, 200) });
         return f;
     } finally {
         URL.revokeObjectURL(url);
@@ -1872,6 +1900,11 @@ document.addEventListener('change', async (e) => {
     busy.textContent = '照片處理中，請稍候…';
     busy.style.cssText = 'position:fixed;inset:0;z-index:99999;display:flex;align-items:center;justify-content:center;background:rgba(0,0,0,.45);color:#fff;font-size:18px;';
     document.body.appendChild(busy);
+    const box = input.closest('[id]');
+    photoStep('picked', { box: box ? box.id : '-',
+                          files: files.map(f => `${f.type || '?'}|${f.size}|${(f.name.match(/\.\w+$/) || [''])[0]}`) });
+    // 讓上面的紀錄先送出，萬一解碼時分頁被收掉才查得到
+    await new Promise(r => setTimeout(r, 100));
     const out = [];
     try {
         for (const f of files) out.push(needsShrink(f) ? await shrinkImage(f) : f);
@@ -1882,7 +1915,10 @@ document.addEventListener('change', async (e) => {
     out.forEach(f => dt.items.add(f));
     input.files = dt.files;
     input.dataset.shrunk = '1';
+    photoStep('handed', { sizes: out.map(f => f.size) });
     input.dispatchEvent(new Event('change', { bubbles: true }));
+    // 交給 Gradio 後 ImageEditor 還要繪製；撐過 8 秒才算完成
+    setTimeout(() => photoStep('done'), 8000);
 }, true);
 window.lastHoverBox = 'main';
 
@@ -2017,9 +2053,10 @@ window.addEventListener('paste', (e) => {
 """
 
 class UploadLogMiddleware:
-    """純 ASGI middleware，負責兩件事：
+    """純 ASGI middleware，負責三件事：
     1. 提供 GET /queue_view（佇列狀態輪詢，刻意不走 Gradio 事件）。
-    2. 記錄每個上傳請求的來源、裝置與大小（docker log 的 [UPLOAD 行），診斷上傳中斷用；
+    2. 提供 POST /client_log，把前端選照片流程的紀錄印成 [CLIENT] 行。
+    3. 記錄每個上傳請求的來源、裝置與大小（docker log 的 [UPLOAD 行），診斷上傳中斷用；
        只包裝 receive 計算位元組數，不讀取或改動上傳內容。
     """
 
@@ -2038,6 +2075,18 @@ class UploadLogMiddleware:
                         "headers": [(b"content-type", b"application/json; charset=utf-8"),
                                     (b"cache-control", b"no-store")]})
             await send({"type": "http.response.body", "body": body})
+            return
+        if scope["type"] == "http" and scope.get("path") == "/client_log" and scope.get("method") == "POST":
+            # 前端選照片流程的紀錄（見 paste_helper_script 的 clientLog），印成 [CLIENT] 行
+            body = b""
+            while True:
+                msg = await receive()
+                body += msg.get("body", b"")
+                if not msg.get("more_body") or len(body) > 4096:
+                    break
+            print(f"[CLIENT] {body[:4096].decode('utf-8', 'replace')}", flush=True)
+            await send({"type": "http.response.start", "status": 204, "headers": []})
+            await send({"type": "http.response.body", "body": b""})
             return
         if scope["type"] != "http" or "upload" not in scope.get("path", ""):
             return await self.app(scope, receive, send)
