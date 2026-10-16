@@ -1276,7 +1276,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
 
     with gr.Accordion("🏆 官網範例一鍵復現 (Reproduce Official Demos)", open=False):
         gr.Markdown(
-            "點擊後會自動套用**官方原始的提示詞、尺寸、步數 40、CFG 1.0、seed 與輸入圖**，"
+            "點擊後會自動套用**官方原始的提示詞、尺寸、步數（Turbo 8 步／一般 40 步）、CFG 1.0、seed 與輸入圖**，"
             "接著直接按 🚀 生成即可。用來判斷本機部署是否已對齊官方表現。"
         )
         with gr.Row():
@@ -1425,7 +1425,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
     # ⚠️ 必須保持展開：Gradio 6 的折疊 Accordion 不渲染子元件，
     # 提交時會送出預設值而非畫面上的值（實測 seed 顯示官方值、送出卻是 -1）。
     # 這些控制項是 run_btn 的 inputs，故不可折疊。
-    with gr.Accordion("⚙️ 生成參數設定 (2K / 40 步 / CFG 1.0 / int8，已對齊官方)", open=True):
+    with gr.Accordion("⚙️ 生成參數設定 (2K / Turbo 8 步 / CFG 1.0)", open=True):
         aspect_ratio = gr.Dropdown(
             choices=[
                 "1:1 (2048x2048) 官方預設",
@@ -1446,9 +1446,12 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             label="⚙️ 權重精度",
             info="切換精度會觸發模型重新載入（int8 約 18 秒、bf16 約 99 秒）"
         )
-        steps = gr.Slider(minimum=15, maximum=50, value=40, step=1, label="推論步數 (官方 README: num_inference_steps=40)")
+        _turbo0 = is_turbo(DEFAULT_PRECISION)
+        steps = gr.Slider(minimum=1 if _turbo0 else 15, maximum=50, value=8 if _turbo0 else 40, step=1,
+                          interactive=not _turbo0,
+                          label="推論步數 (Turbo 固定 8 步)" if _turbo0 else "推論步數 (官方 README: num_inference_steps=40)")
         cfg = gr.Slider(
-            minimum=1.0, maximum=5.0, value=1.0, step=0.1,
+            minimum=1.0, maximum=5.0, value=1.0, step=0.1, interactive=not _turbo0,
             label="提示詞引導強度 (CFG)",
             info="【官方標準：1.0】Diffusers 與官方 ComfyUI 預設值。設為 1.0 時無負向引導干擾。"
         )
