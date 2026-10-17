@@ -1202,6 +1202,23 @@ def send_paths_to_refs(fps, refs, cur_mode):
 
 
 custom_css = '''
+/* 功能區塊底色：地圖四色原則，相鄰區塊不同色
+   產物管理=1 / 官網範例=2 / 左欄=3（內含畫布=1、參考庫=2）/ 右欄=4 / 生成參數=1 / 回看=2 */
+.zone-1 { --zone-bg: #e8f1fd; --zone-edge: #9cc0ef; }
+.zone-2 { --zone-bg: #fdf3e1; --zone-edge: #ecc27a; }
+.zone-3 { --zone-bg: #e9f7ec; --zone-edge: #93d0a2; }
+.zone-4 { --zone-bg: #f6ebfa; --zone-edge: #cfa3e0; }
+.dark .zone-1 { --zone-bg: #16243a; --zone-edge: #2f4f7d; }
+.dark .zone-2 { --zone-bg: #33270f; --zone-edge: #6e5322; }
+.dark .zone-3 { --zone-bg: #13301c; --zone-edge: #2d6a3e; }
+.dark .zone-4 { --zone-bg: #2c1836; --zone-edge: #5e3a70; }
+.zone-1, .zone-2, .zone-3, .zone-4 {
+    background: var(--zone-bg) !important;
+    border: 1px solid var(--zone-edge) !important;
+    border-radius: 10px !important; padding: 10px !important;
+    --block-background-fill: var(--zone-bg);
+    --background-fill-secondary: var(--zone-bg);
+}
 .output-checkerboard {
     background-image: linear-gradient(45deg, #ddd 25%, transparent 25%), 
                       linear-gradient(-45deg, #ddd 25%, transparent 25%), 
@@ -1251,7 +1268,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
     gr.Markdown("# 🎨 Qwen-Image-2.1 影像生成與智能圈選編輯平台 (官方規範版)")
     gr.Markdown("**硬體**: NVIDIA DGX Spark (GB10 Grace Blackwell ARM64) | **標準**: Single-Stream MMDiT + Qwen3-VL | **官方標準**: CFG 1.0 | Euler + Simple | 支援 1~10 張多圖參考")
     
-    with gr.Accordion("🗂️ 產物管理 (打包下載 / 清理)", open=False):
+    with gr.Accordion("🗂️ 產物管理 (打包下載 / 清理)", open=False, elem_classes=["zone-1"]):
         with gr.Row():
             with gr.Column():
                 gr.Markdown("**📦 打包下載**　把伺服器上的輸出圖片打包成 zip")
@@ -1274,7 +1291,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                     btn_purge = gr.Button("💣 清空全部", variant="stop")
                     purge_status = gr.Markdown("")
 
-    with gr.Accordion("🏆 官網範例一鍵復現 (Reproduce Official Demos)", open=False):
+    with gr.Accordion("🏆 官網範例一鍵復現 (Reproduce Official Demos)", open=False, elem_classes=["zone-2"]):
         gr.Markdown(
             "點擊後會自動套用**官方原始的提示詞、尺寸、步數（Turbo 8 步／一般 40 步）、CFG 1.0、seed 與輸入圖**，"
             "接著直接按 🚀 生成即可。用來判斷本機部署是否已對齊官方表現。"
@@ -1288,7 +1305,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
         demo_status = gr.Markdown("")
 
     with gr.Row():
-        with gr.Column(scale=5):
+        with gr.Column(scale=5, elem_classes=["zone-3"]):
             # 分頁僅作為模式選擇器；畫布與參考圖庫為三個模式共用，
             # 故留在分頁之外，靠既有的顯示/隱藏邏輯切換，避免重複元件與狀態同步問題。
             mode = gr.State(MODE_EDIT)
@@ -1309,7 +1326,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 hist_bridge_ref = gr.Button("ref", elem_id="hist_bridge_ref")
 
             # --- 模式 1 容器: 畫布塗抹/圈選 ---
-            with gr.Group(visible=True) as edit_canvas_container:
+            with gr.Group(visible=True, elem_classes=["zone-1"]) as edit_canvas_container:
                 edit_submode = gr.Radio(
                     choices=[
                         "🎯 畫圈視覺引導 (Circle Grounding - 帶彩色圈交給 Qwen3-VL 識別)",
@@ -1332,7 +1349,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 btn_pick_main = gr.Button("🕘 從過往圖片選擇主圖", size="sm")
                 
             # --- 模式 1 & 2 共用: 多張參考圖管理庫 (支援最多 10 張) ---
-            with gr.Group(visible=True) as ref_images_container:
+            with gr.Group(visible=True, elem_classes=["zone-2"]) as ref_images_container:
                 gr.Markdown("### 📎 多圖參考庫 (支援 1~10 張，可不斷按 Ctrl+V 連續貼上新圖)")
                 
                 with gr.Row():
@@ -1400,7 +1417,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             
             run_btn = gr.Button(RUN_BTN_LABEL, variant="primary", size="lg", elem_id="run_btn")
 
-        with gr.Column(scale=4):
+        with gr.Column(scale=4, elem_classes=["zone-4"]):
             output_img = gr.Image(
                 label="🖼️ 輸出結果 (新圖像)",
                 type="pil",
@@ -1425,7 +1442,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
     # ⚠️ 必須保持展開：Gradio 6 的折疊 Accordion 不渲染子元件，
     # 提交時會送出預設值而非畫面上的值（實測 seed 顯示官方值、送出卻是 -1）。
     # 這些控制項是 run_btn 的 inputs，故不可折疊。
-    with gr.Accordion("⚙️ 生成參數設定 (2K / Turbo 8 步 / CFG 1.0)", open=True):
+    with gr.Accordion("⚙️ 生成參數設定 (2K / Turbo 8 步 / CFG 1.0)", open=True, elem_classes=["zone-1"]):
         aspect_ratio = gr.Dropdown(
             choices=[
                 "1:1 (2048x2048) 官方預設",
@@ -1469,7 +1486,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
         precision.change(on_precision_change, inputs=precision, outputs=[steps, cfg])
         demo.load(on_precision_change, inputs=precision, outputs=[steps, cfg])
 
-    with gr.Accordion("🕘 回看 (生成紀錄)", open=False):
+    with gr.Accordion("🕘 回看 (生成紀錄)", open=False, elem_classes=["zone-2"]):
         with gr.Row():
             hist_limit = gr.Number(value=10, precision=0, label="顯示最近幾筆", scale=1)
             btn_hist = gr.Button("🔄 重新整理", scale=1)
