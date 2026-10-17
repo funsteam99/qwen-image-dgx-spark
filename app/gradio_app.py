@@ -1203,7 +1203,7 @@ def send_paths_to_refs(fps, refs, cur_mode):
 
 custom_css = '''
 /* 功能區塊底色：地圖四色原則，相鄰區塊不同色
-   產物管理=1 / 官網範例=2 / 左欄=3（內含畫布=1、參考庫=2）/ 右欄=4 / 生成參數=1 / 回看=2 */
+   產物管理=1 / 官網範例=2 / 左欄=3（內含畫布=1、參考庫=2、Prompt 改寫=1）/ 右欄=4 / 生成參數=1 / 回看=2 */
 .zone-1 { --zone-bg: #e8f1fd; --zone-edge: #9cc0ef; }
 .zone-2 { --zone-bg: #fdf3e1; --zone-edge: #ecc27a; }
 .zone-3 { --zone-bg: #e9f7ec; --zone-edge: #93d0a2; }
@@ -1378,27 +1378,29 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                     show_label=True
                 )
 
-            orig_prompt_display = gr.Textbox(
-                label="📝 原始提示詞（手動輸入，每次按「Prompt 改寫」都以這裡的內容為準）",
-                placeholder="在這裡輸入你的指令，例如：一隻橘貓坐在窗台上看著窗外下雨，水彩畫風格",
-                lines=2
-            )
-
-            prompt = gr.Textbox(
-                label="✨ 擴寫後提示詞 (Prompt - 會送去生成；建議依官方規範使用 <image1>, <image2> 錨定)",
-                placeholder="按上方輸入原始提示詞後，點「Prompt 改寫」產生的結果會顯示於此；也可直接在此手動輸入",
-                lines=3
-            )
-
-            with gr.Row():
-                btn_pe = gr.Button("✨ Prompt 改寫", variant="secondary", size="lg")
-                pe_backend = gr.Dropdown(
-                    choices=list(PE_BACKENDS.keys()),
-                    value=DEFAULT_PE_BACKEND,
-                    label="改寫引擎",
-                    scale=2
+            # Prompt 改寫區：獨立底色（zone-1，與上方參考庫 zone-2、外框左欄 zone-3 不同）
+            with gr.Column(elem_classes=["zone-1"]):
+                orig_prompt_display = gr.Textbox(
+                    label="📝 原始提示詞（手動輸入，每次按「Prompt 改寫」都以這裡的內容為準）",
+                    placeholder="在這裡輸入你的指令，例如：一隻橘貓坐在窗台上看著窗外下雨，水彩畫風格",
+                    lines=2
                 )
-            pe_status = gr.Markdown("")
+
+                prompt = gr.Textbox(
+                    label="✨ 擴寫後提示詞 (Prompt - 會送去生成；建議依官方規範使用 <image1>, <image2> 錨定)",
+                    placeholder="按上方輸入原始提示詞後，點「Prompt 改寫」產生的結果會顯示於此；也可直接在此手動輸入",
+                    lines=3
+                )
+
+                with gr.Row():
+                    btn_pe = gr.Button("✨ Prompt 改寫", variant="secondary", size="lg")
+                    pe_backend = gr.Dropdown(
+                        choices=list(PE_BACKENDS.keys()),
+                        value=DEFAULT_PE_BACKEND,
+                        label="改寫引擎",
+                        scale=2
+                    )
+                pe_status = gr.Markdown("")
 
             with gr.Accordion("💡 官方 GitHub 標準提示詞範本 (一鍵填入)", open=False):
                 gr.Markdown("*遵循官方 `system_prompt_edit.txt` 規範：使用 `<imageX>` 明確指定主體與部件，並加入光影與細節保持約束。*")
