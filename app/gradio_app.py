@@ -1419,32 +1419,34 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             
             run_btn = gr.Button(RUN_BTN_LABEL, variant="primary", size="lg", elem_id="run_btn")
 
-        with gr.Column(scale=4, elem_classes=["zone-4"]):
-            output_img = gr.Image(
-                label="🖼️ 輸出結果 (新圖像)",
-                type="pil",
-                image_mode="RGBA",
-                elem_classes=["output-checkerboard"]
-            )
-            submit_status = gr.Markdown("")
-            gr.Markdown("### 📋 佇列狀態（整個 ComfyUI 佇列，每 3 秒更新）")
-            # 內容由前端 JS 輪詢 /queue_view 填入（見 paste_helper_script），不用 gr.Timer
-            queue_html = gr.HTML('<div id="queue_view"><p>載入中…</p></div>')
-            my_jobs = gr.State([])
-            with gr.Row(elem_classes=["hist-bridge"]):
-                cancel_bridge_id = gr.Textbox(elem_id="cancel_bridge_id", show_label=False)
-                cancel_bridge_btn = gr.Button("cancel", elem_id="cancel_bridge_btn")
-                # 本頁送出的 job id（逗號分隔），給前端輪詢用
-                my_jobs_box = gr.Textbox(elem_id="my_jobs_box", show_label=False)
-                # 前端發現新完成的工作時，寫入 id 並點按鈕把結果載入輸出區
-                result_bridge_id = gr.Textbox(elem_id="result_bridge_id", show_label=False)
-                result_bridge_btn = gr.Button("result", elem_id="result_bridge_btn")
+        # 右欄：輸出區（zone-4）與回看（zone-2）各自成塊，回看緊接在輸出下方
+        with gr.Column(scale=4):
+            with gr.Column(elem_classes=["zone-4"]):
+                output_img = gr.Image(
+                    label="🖼️ 輸出結果 (新圖像)",
+                    type="pil",
+                    image_mode="RGBA",
+                    elem_classes=["output-checkerboard"]
+                )
+                submit_status = gr.Markdown("")
+                gr.Markdown("### 📋 佇列狀態（整個 ComfyUI 佇列，每 3 秒更新）")
+                # 內容由前端 JS 輪詢 /queue_view 填入（見 paste_helper_script），不用 gr.Timer
+                queue_html = gr.HTML('<div id="queue_view"><p>載入中…</p></div>')
+                my_jobs = gr.State([])
+                with gr.Row(elem_classes=["hist-bridge"]):
+                    cancel_bridge_id = gr.Textbox(elem_id="cancel_bridge_id", show_label=False)
+                    cancel_bridge_btn = gr.Button("cancel", elem_id="cancel_bridge_btn")
+                    # 本頁送出的 job id（逗號分隔），給前端輪詢用
+                    my_jobs_box = gr.Textbox(elem_id="my_jobs_box", show_label=False)
+                    # 前端發現新完成的工作時，寫入 id 並點按鈕把結果載入輸出區
+                    result_bridge_id = gr.Textbox(elem_id="result_bridge_id", show_label=False)
+                    result_bridge_btn = gr.Button("result", elem_id="result_bridge_btn")
 
-    with gr.Accordion("🕘 回看 (生成紀錄)", open=False, elem_classes=["zone-2"]):
-        with gr.Row():
-            hist_limit = gr.Number(value=10, precision=0, label="顯示最近幾筆", scale=1)
-            btn_hist = gr.Button("🔄 重新整理", scale=1)
-        hist_html = gr.HTML("<p>按「🔄 重新整理」載入紀錄。</p>")
+            with gr.Accordion("🕘 回看 (生成紀錄)", open=False, elem_classes=["zone-2"]):
+                with gr.Row():
+                    hist_limit = gr.Number(value=10, precision=0, label="顯示最近幾筆", scale=1)
+                    btn_hist = gr.Button("🔄 重新整理", scale=1)
+                hist_html = gr.HTML("<p>按「🔄 重新整理」載入紀錄。</p>")
 
     # 生成參數置於頁面最下方：平時不佔版面，需要時捲到底調整。
     # ⚠️ 必須保持展開：Gradio 6 的折疊 Accordion 不渲染子元件，
