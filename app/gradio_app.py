@@ -1440,6 +1440,12 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                 result_bridge_id = gr.Textbox(elem_id="result_bridge_id", show_label=False)
                 result_bridge_btn = gr.Button("result", elem_id="result_bridge_btn")
 
+            with gr.Accordion("🕘 回看 (生成紀錄)", open=False, elem_classes=["zone-2"]):
+                with gr.Row():
+                    hist_limit = gr.Number(value=10, precision=0, label="顯示最近幾筆", scale=1)
+                    btn_hist = gr.Button("🔄 重新整理", scale=1)
+                hist_html = gr.HTML("<p>按「🔄 重新整理」載入紀錄。</p>")
+
     # 生成參數置於頁面最下方：平時不佔版面，需要時捲到底調整。
     # ⚠️ 必須保持展開：Gradio 6 的折疊 Accordion 不渲染子元件，
     # 提交時會送出預設值而非畫面上的值（實測 seed 顯示官方值、送出卻是 -1）。
@@ -1487,12 +1493,6 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                     gr.update(interactive=True))
         precision.change(on_precision_change, inputs=precision, outputs=[steps, cfg])
         demo.load(on_precision_change, inputs=precision, outputs=[steps, cfg])
-
-    with gr.Accordion("🕘 回看 (生成紀錄)", open=False, elem_classes=["zone-2"]):
-        with gr.Row():
-            hist_limit = gr.Number(value=10, precision=0, label="顯示最近幾筆", scale=1)
-            btn_hist = gr.Button("🔄 重新整理", scale=1)
-        hist_html = gr.HTML("<p>按「🔄 重新整理」載入紀錄。</p>")
 
     # --- 參考圖動態管理邏輯 ---
     def add_single_ref(new_img, current_list):
