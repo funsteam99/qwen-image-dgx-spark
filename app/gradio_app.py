@@ -21,6 +21,37 @@ from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 COMFY_HOST = "127.0.0.1:8188"
 
+# =============================================================================
+# H3 忙碌狀態：minimax-h3-studio 的 pipeline.sh 跑 H3 前會停掉 qwen-image-comfyui，
+# 但保留這個前端常駐；它在停之前/復原後打 POST /busy_status 設/清這個旗標，
+# 前端輪詢時顯示提示而不是「無法讀取 ComfyUI 佇列」的連線錯誤。
+# 存檔是為了前端容器重啟時旗標不會憑空消失（例如 H3 還在跑、前端剛好被重啟）。
+# =============================================================================
+BUSY_STATUS_FILE = os.environ.get("BUSY_STATUS_FILE", "/workspace/busy_status.json")
+BUSY_STATUS_LOCK = threading.Lock()
+
+
+def _load_busy_status():
+    try:
+        with open(BUSY_STATUS_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return {"busy": bool(data.get("busy")), "reason": data.get("reason") or None}
+    except Exception:
+        return {"busy": False, "reason": None}
+
+
+def _save_busy_status(busy, reason):
+    data = {"busy": bool(busy), "reason": (reason or None), "updated": time.time()}
+    tmp = BUSY_STATUS_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False)
+    os.replace(tmp, BUSY_STATUS_FILE)
+    return data
+
+
+with BUSY_STATUS_LOCK:
+    BUSY_STATUS = _load_busy_status()
+
 # 模式識別碼。以穩定 id 取代先前的長字串比對 —— 改標題文字不會再牽動邏輯。
 MODE_EDIT = "edit"
 MODE_MULTI = "multi"
@@ -669,10 +700,22 @@ def build_queue_view(my_jobs):
     由前端 JS 輪詢 /queue_view 呼叫，不走 Gradio 事件：Gradio 每個事件的狀態變化都會向
     「曾參與事件的元件」重新取值，主圖 ImageEditor 每取一次值就把整張圖重新上傳一次。
     """
+    with BUSY_STATUS_LOCK:
+        status = dict(BUSY_STATUS)
+    if status["busy"]:
+        reason = _esc(status["reason"] or "H3 正在運作")
+        banner = (f'<p style="background:#fef3c7;color:#92400e;padding:8px 12px;'
+                  f'border-radius:6px;margin:0 0 8px">⏸️ {reason}，請稍等，暫停出圖。</p>')
+    else:
+        banner = ""
+
     try:
         q = _comfy_json("/queue")
     except Exception as e:
-        return f'<p style="color:#b91c1c">無法讀取 ComfyUI 佇列：{_esc(str(e))}</p>', None
+        if status["busy"]:
+            # 預期中的連線錯誤（ComfyUI 已依互斥規則停掉），不要再疊一個紅字錯誤
+            return banner, None
+        return banner + f'<p style="color:#b91c1c">無法讀取 ComfyUI 佇列：{_esc(str(e))}</p>', None
     running = q.get("queue_running", [])
     pending = sorted(q.get("queue_pending", []), key=lambda it: it[0])
     mine = set(my_jobs or [])
@@ -698,7 +741,7 @@ def build_queue_view(my_jobs):
         label = _short(v["prompt"]) + (f"｜{v['error'][:120]}" if v["error"] else "")
         rows.append(row(ic, st, k, label, None))
 
-    html = f"<p>執行中 {len(running)}、排隊 {len(pending)}。已結束的只列本頁面（7860）送出的最近 5 張。</p>"
+    html = banner + f"<p>執行中 {len(running)}、排隊 {len(pending)}。已結束的只列本頁面（7860）送出的最近 5 張。</p>"
     if rows:
         html += ('<table class="review-table"><thead><tr><th style="width:110px">狀態</th>'
                  "<th>提示詞</th><th style='width:50px'></th><th style='width:60px'></th></tr></thead>"
@@ -2077,17 +2120,20 @@ window.addEventListener('paste', (e) => {
 """
 
 class UploadLogMiddleware:
-    """純 ASGI middleware，負責三件事：
+    """純 ASGI middleware，負責四件事：
     1. 提供 GET /queue_view（佇列狀態輪詢，刻意不走 Gradio 事件）。
     2. 提供 POST /client_log，把前端選照片流程的紀錄印成 [CLIENT] 行。
     3. 記錄每個上傳請求的來源、裝置與大小（docker log 的 [UPLOAD 行），診斷上傳中斷用；
        只包裝 receive 計算位元組數，不讀取或改動上傳內容。
+    4. 提供 GET/POST /busy_status：minimax-h3-studio 的 pipeline.sh 用來設/清「H3 正在運作」
+       的忙碌旗標，供 build_queue_view() 顯示提示用，詳見 BUSY_STATUS 的註解。
     """
 
     def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
+        global BUSY_STATUS
         if scope["type"] == "http" and scope.get("path") == "/queue_view" and scope.get("method") == "GET":
             # 佇列狀態輪詢：刻意不走 Gradio 事件（理由見 build_queue_view）
             import asyncio, re, urllib.parse
@@ -2098,6 +2144,34 @@ class UploadLogMiddleware:
             await send({"type": "http.response.start", "status": 200,
                         "headers": [(b"content-type", b"application/json; charset=utf-8"),
                                     (b"cache-control", b"no-store")]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        if scope["type"] == "http" and scope.get("path") == "/busy_status" and scope.get("method") == "GET":
+            with BUSY_STATUS_LOCK:
+                body = json.dumps(BUSY_STATUS).encode("utf-8")
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"application/json; charset=utf-8"),
+                                    (b"cache-control", b"no-store")]})
+            await send({"type": "http.response.body", "body": body})
+            return
+        if scope["type"] == "http" and scope.get("path") == "/busy_status" and scope.get("method") == "POST":
+            # minimax-h3-studio 的 pipeline.sh 用這個端點設/清忙碌旗標；沒有驗證身分
+            # （跟 /client_log 一樣，是同一個 Tailscale 私人網路內的互信呼叫）。
+            raw = b""
+            while True:
+                msg = await receive()
+                raw += msg.get("body", b"")
+                if not msg.get("more_body") or len(raw) > 4096:
+                    break
+            try:
+                payload = json.loads(raw.decode("utf-8") or "{}")
+                with BUSY_STATUS_LOCK:
+                    BUSY_STATUS = _save_busy_status(payload.get("busy"), payload.get("reason"))
+                status, body = 200, b'{"ok":true}'
+            except Exception as e:
+                status, body = 400, json.dumps({"ok": False, "error": str(e)}).encode("utf-8")
+            await send({"type": "http.response.start", "status": status,
+                        "headers": [(b"content-type", b"application/json; charset=utf-8")]})
             await send({"type": "http.response.body", "body": body})
             return
         if scope["type"] == "http" and scope.get("path") == "/client_log" and scope.get("method") == "POST":
