@@ -827,3 +827,78 @@ docker exec -d qwen-image-comfyui sh -c   'cd /workspace/ComfyUI/pe && python3 p
 - `[UPLOAD start]` / `[UPLOAD end]`：每個上傳請求的來源（`via=tailscale-serve(https)` / `direct(http)` / `localhost`）、Tailscale 使用者、宣告大小與實收位元組、是否斷線、耗時、User-Agent。
 - `[CLIENT]`（commit `389c126`）：選照片的每一步 `picked` → `decoded` → `shrunk` → `handed` → `done`（交給 Gradio 後撐過 8 秒）。每步先寫入 localStorage，分頁被 iOS 收掉時，下次載入的 `page_load` 會帶 `prev_step`，顯示上一頁停在哪一步。停在 `picked` 表示解碼時當掉，停在 `handed` 表示 ImageEditor 繪製時出事。
 - 今天另有一次選照片後重載、照片未送達伺服器，事後同一張照片（12MP JPEG，3.8 MB，解碼 0.1 秒）無法重現，原因未明；再發生時看 `prev_step`。
+
+
+## 19. 【2026-10-17】主機假死失聯 4 小時：`wireplumber` 孤兒進程記憶體洩漏 22.5 GB 與 OOM 權重盲區
+
+**症狀**：
+- 下午 16:30 起，DGX Spark 在 Tailscale 顯示 `offline`，外部 `https://<DGX_HOSTNAME>:8443` 與 SSH 均無法連入。
+- 經同區網 Xavier 探測：底層 Linux 核心 ICMP Ping 僅 0.5 ms（未關機），且 22、7860、8002、8006、8188 埠皆為 OPEN，但應用層（User-space）陷入嚴重 Swap Thrashing 假死：SSH 卡在 Banner exchange 逾時，8002 `/health` 回應耗時 55～120 秒以上。
+- 持續約 4 小時後，於 **20:33:46** 系統自行解套恢復，Load Average 由 `70.22` 降至 `0.22`，Tailscale 自動重連，且 **8002（llama.cpp 35B）、8006（vLLM 27B）、8188（ComfyUI）、7860（Gradio）四大服務全數存活未中斷**。
+
+**根因排查（`journalctl` 核心 OOM 日誌與 `nvidia-smi`）**：
+1. **AI 模型皆非元兇**：
+   - 三大 AI 服務實測常駐僅約 **78.4 GiB**（8002 `23.4 GiB` + 8006 `38.5 GiB` + 8188 `16.5 GiB`），距離 121 GiB 上限尚有 40 GiB 以上安全裕度。
+2. **真兇：Ubuntu 桌面音訊管理員 `wireplumber` 嚴重記憶體洩漏（獨吞 22.5 GB）**：
+   - Spark 目前無外接麥克風與攝影機（先前測試實體麥克風的 `~/breeze-asr-hub` `breeze-realtime.service` 早已停用），但 Ubuntu 24.04 預設在使用者登入時拉起 `pipewire` 與 `wireplumber`。
+   - 因無攝影機／音訊硬體且缺 `libcamera`，`wireplumber` 持續報錯（`Failed to call Lookup: No entry for camera`、`RegisterProfile() failed: org.bluez.Error.NotPermitted`）並發生嚴重 Memory Leak。
+   - 核心日誌顯示 20:33:46 最終被處決的 `wireplumber (PID 2169877)` 單一進程膨脹達 **22.5 GB**（`total-vm: 22550248kB`, `anon-rss: 17.8 GB`, 另佔 Swap `4.2 GB`）。
+3. **為何之前無感，唯獨本次卡死 4 小時？（`oom_score_adj` 權重盲區）**：
+   - 歷史紀錄顯示 `10/16 14:41`（9.4 GB）、`10/17 00:18`（4.8 GB）、`10/17 10:47`（5.3 GB）`wireplumber` 皆曾洩漏觸發 OOM，但當時是由 `user@1000.service` 標準啟動，帶有 **`oom_score_adj: 200`**（加罰 20% 總記憶體權重），因此一滿載即在 1 毫秒內被 OOM Killer 精準秒殺，系統毫無停頓。
+   - 本次事故源於 `10/15 16:24:40` 的一筆外部 SSH Session（`session-311862.scope`）意外在 Session Scope 內衍生出**第二隻孤兒 `wireplumber (PID 2169877)`**，其權重為 **`oom_score_adj: 0`**。
+   - 當這隻孤兒進程歷經 52 小時洩漏至 22.5 GB（OOM 分數約 180）並榨乾記憶體時，`user@1000.service` 下僅佔 20～70 MB 的 `hermes` / `python` 進程因自帶 `oom_score_adj: 200`（分數 > 200）反而優先受死。OOM Killer 從 12:09 至 20:33 連續誤殺小進程 30 餘次，每次僅釋放數十 MB 又立即重啟，導致系統受困於 Swap 換頁風暴長達 4 小時，直到 20:33:46 同一秒內殺光 `oom_score_adj: 200` 進程後才終於處決 `PID 2169877`，瞬間釋放 19 GiB 記憶體。
+
+**處置與永久根治**：
+- 已於 Spark 停用並以 `mask` 徹底封鎖使用者層級的 `wireplumber` 與 `pipewire` 服務及 Socket 觸發器（不影響 TTS 語音合成 `VoxCPM2`、瀏覽器收音與任何 AI 推論服務）：
+  ```bash
+  systemctl --user stop wireplumber.service pipewire.service pipewire-pulse.service pipewire.socket pipewire-pulse.socket
+  systemctl --user mask wireplumber.service pipewire.service pipewire-pulse.service pipewire.socket pipewire-pulse.socket
+  ```
+- 日後若需在 Spark 主機本體重接實體 USB 麥克風或喇叭，可隨時解除屏蔽恢復：
+  ```bash
+  systemctl --user unmask wireplumber.service pipewire.service pipewire-pulse.service pipewire.socket pipewire-pulse.socket
+  systemctl --user start pipewire.socket pipewire-pulse.socket wireplumber.service
+  ```
+
+
+## 20. 【2026-10-19】實體戰情室畫面（`tty1` `nvtop`）混亂與 `funsteam` 每 8 秒高頻 SSH 輪詢優化
+
+**症狀**：
+- Spark 外接螢幕（`tty1`，執行 `nvtop`）在 10/17 假死期間被大量系統錯誤訊息洗版覆蓋。
+- 檢查 `journalctl -u ssh -u systemd-logind` 發現：`100.66.93.102`（`funsteam` Windows 電腦，`192.168.0.112`）每隔 7～8 秒就以 `codex-dgx-spark` 金鑰對 Spark 發起 **2 次** SSH 登入，導致 `systemd-logind` 累積滿 **8,192 個 `closing` 殭屍 Sessions**（報錯：`Maximum number of sessions (8192) reached, refusing further sessions`），且每次登入皆觸發 `/etc/update-motd.d/`（`fwupd`、`apt-check`）。
+
+**根因排查**：
+- 連入 `funsteam`（`user@192.168.0.112`）定位到 Windows 開機啟動項目 `Startup\StartWarRoom.vbs`，在背景執行 `C:\Users\user\spark-xavier-warroom\server.js`（Port `3700` 網頁戰情室）。
+- 該 `server.js` 設定 `setInterval(pollAll, 8000)` 無論有無開啟網頁，每 8 秒對 Spark 發起 2 次 SSH（第 1 次查 `uptime`/`nvidia-smi`/`free`/`df`/`docker ps`，第 2 次查 `ps aux | grep -v grep | grep hermes_cli`），每日高達 **21,600 次 SSH 登入**。
+
+**處置與優化**：
+1. **遠端重繪 Spark 實體螢幕 `tty1`**：
+   ```bash
+   printf '\033c\033[2J\033[H' > /dev/tty1 && kill -WINCH $(pgrep -t tty1 nvtop)
+   ```
+2. **優化 `funsteam` 戰情室 `C:\Users\user\spark-xavier-warroom\server.js`**（原檔備份為 `server.js.bak-20261019`）：
+   - **合併單趟 SSH**：將 `hermes_cli` 檢查併入同一次 SSH 指令（`===HERMES===` 區塊），砍半每次輪詢的 SSH 連線數。
+   - **智慧動態輪詢（Adaptive Polling）**：有人開啟 `localhost:3700` 戰情室網頁時每 **15 秒** 更新一次；無人觀看網頁時自動降頻為每 **5 分鐘** 巡檢一次（閒置時減少 **98.7%** 的 SSH 登入次數，從每日 21,600 次降至 288 次），並於重新打開網頁時立即觸發更新。
+3. **清理 Spark 上 8,190 個卡死在 `closing` 的舊 `systemd-logind` Sessions**：
+   - 重啟 `systemd-logind.service` 後，`loginctl list-sessions` 已從 8,192 個降回正常的 **2 個**（`tty1` 與 `llama-server`），新 SSH 連線結束後均可正常回收（`Removed session`）。
+4. **【2026-10-28 補充】永久根治 `tty1` 核心雜訊洗版與自動重繪守護 (`tty1-guard.service`)**：
+   - **成因**：Linux 預設將核心訊息（`kernel.printk = 4 4 1 7`）直接印到 `/dev/tty1`（如每 3 小時因無 GUI 而崩潰 5 次的 `snap.firmware-updater.firmware-notifier` AppArmor 審計警告、每小時 47 分的 `ubuntu_pro_esm_cache`、Wi-Fi 頻寬切換或 `workqueue` 提示），導致 `nvtop` 局部更新畫面殘留字元與錯位。
+   - **處置 1（消滅定時崩潰源）**：停用並 `mask` 使用者層級的 `snap.firmware-updater.firmware-notifier.timer` 與 `.service`，每日減少 40 次無效崩潰與核心審計刷屏。
+   - **處置 2（建立自動重繪守護服務）**：於 Spark 建立 `~/.local/bin/tty1-guard.sh` 與 `~/.config/systemd/user/tty1-guard.service`（已設為開機自啟 `enabled`），即時監聽 `journalctl -k -f`；一旦核心往 `tty1` 印出任何文字，會在 0.5 秒內自動執行 `printf "\033c\033[2J\033[H" > /dev/tty1 && kill -WINCH $(pgrep -t tty1 nvtop)` 瞬間重繪恢復乾淨畫面。
+
+
+
+## 21. 【2026-11-03】ComfyUI 按需啟動：前端常駐、ComfyUI 閒置自動停止
+
+- **目的**：讓 `qwen-image-comfyui` 平時不佔記憶體，Spark 上的其他專案（minimax-h3-studio 等）才有空間跑；8443 前端保持常駐。
+- **元件**：主機上的 `~/qwen-image/comfy_ondemand.py`（`systemctl --user` 服務 `comfy-ondemand`，只聽 `127.0.0.1:8190`）。
+  - `GET /status`：`stopped / starting / running`，附忙碌旗標與可用記憶體。
+  - `POST /ensure`：前端按「開始生成」時呼叫；條件符合就 `docker start` 並等 ComfyUI 就緒。
+  - `POST /release`：佇列空才停；閒置 15 分鐘（`IDLE_STOP_MIN`）由內建 watchdog 自動呼叫。
+- **與其他專案的約定（沿用對方已部署的做法，不另立一套）**：
+  - 對方跑 H3 前打 7860 的 `POST /busy_status`（`{"busy": true, "reason": ...}`），等 Qwen 佇列清空後自己停掉 `qwen-image-comfyui`，結束時清回 `false`。旗標存在 `~/qwen-image/busy_status.json`。
+  - 按需服務在下列情況**拒絕啟動**，前端顯示原因：`busy=true`、有 `h3-*` / `demucs*` 容器在跑、`MemAvailable` 低於 45 GB（`MIN_AVAILABLE_GB`）。
+  - 啟動後再檢查一次旗標；若對方剛好在這期間設了 busy，就立刻把容器停回去讓出 GPU。
+  - 按需服務只操作 `qwen-image-comfyui`，從不動 8002、8006 等其他服務。
+- **容器重啟政策改為 `no`**（compose 與現有容器都已改），開機或 Docker 重啟時不會自己起來佔記憶體。
+- **冷啟動**：容器本身約 6 秒就緒，模型權重在第一張圖送出時才載入，所以第一張會比較慢。

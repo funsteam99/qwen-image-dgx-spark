@@ -78,6 +78,32 @@ def is_turbo(precision):
     return "turbo" in WEIGHT_PRESETS.get(precision, ("",))[0]
 DEFAULT_PRECISION = "turbo int8 (8 步加速版，省記憶體)"
 PE_HOST = "127.0.0.1:8200"   # 官方 Prompt Enhancer 常駐服務 (pe/pe_server.py)
+# ComfyUI 按需啟動服務（主機上的 comfy_ondemand.py）：平常 ComfyUI 停著，送出工作前才啟動，
+# 閒置自動停止。它沿用 BUSY_STATUS 的約定，其他專案佔用 GPU 時拒絕啟動。
+ONDEMAND_HOST = "127.0.0.1:8190"
+
+
+def _ondemand(path, method="GET", timeout=10):
+    req = urllib.request.Request(f"http://{ONDEMAND_HOST}{path}", method=method,
+                                 data=b"" if method == "POST" else None)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read().decode("utf-8"))
+
+
+def ensure_comfy():
+    """送出工作前確保 ComfyUI 在跑；停著就請按需服務啟動（冷啟動約 1~2 分鐘）。"""
+    try:
+        st = _ondemand("/status")
+    except Exception:
+        return  # 按需服務沒開：維持舊行為，直接連 ComfyUI
+    if st.get("state") != "running":
+        gr.Info("模型服務待命中，正在啟動（約 1~2 分鐘），完成後自動送出。")
+    try:
+        res = _ondemand("/ensure", method="POST", timeout=300)
+    except Exception as e:
+        raise gr.Error(f"啟動模型服務失敗：{type(e).__name__}: {e}")
+    if not res.get("ok"):
+        raise gr.Error(f"暫時無法生成：{res.get('reason')}")
 
 # --- Prompt 改寫後端 ---------------------------------------------------------
 # 本機已有的 vLLM 服務 (qwen3.8-27B，具視覺能力) 可直接擔任改寫器：
@@ -346,6 +372,7 @@ def send_to_comfy(
     # 「擴寫後」欄位若是空的（例如使用者只打了原始提示詞、還沒按「Prompt 改寫」就直接生成），
     # 就退回用「原始提示詞」欄位的內容送去生成，避免送出空提示詞。
     # 記下 was_rewritten，讓「回看」能區分「真的擴寫過」和「只是退回原始提示詞」。
+    ensure_comfy()
     prompt = (prompt or "").strip()
     was_rewritten = bool(prompt)
     prompt = prompt or (original_prompt or "").strip()
@@ -715,6 +742,15 @@ def build_queue_view(my_jobs):
         if status["busy"]:
             # 預期中的連線錯誤（ComfyUI 已依互斥規則停掉），不要再疊一個紅字錯誤
             return banner, None
+        try:
+            st = _ondemand("/status", timeout=3)
+        except Exception:
+            st = {}
+        if st.get("state") == "starting":
+            return '<p>⏳ 模型服務啟動中…</p>', None
+        if st.get("state") == "stopped":
+            return ('<p>💤 模型服務待命中（閒置會自動停止以讓出記憶體），'
+                    '按「開始生成」會自動啟動，約 1~2 分鐘。</p>'), None
         return banner + f'<p style="color:#b91c1c">無法讀取 ComfyUI 佇列：{_esc(str(e))}</p>', None
     running = q.get("queue_running", [])
     pending = sorted(q.get("queue_pending", []), key=lambda it: it[0])

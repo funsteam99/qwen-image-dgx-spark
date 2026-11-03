@@ -4,7 +4,8 @@ services:
   qwen-comfyui:
     image: qwen-image-studio:latest
     container_name: qwen-image-comfyui
-    restart: always
+    # 不自動重啟：平常停著，由主機上的 comfy_ondemand.py 按需啟動、閒置停止。
+    restart: "no"
     ipc: host
     network_mode: host
     deploy:

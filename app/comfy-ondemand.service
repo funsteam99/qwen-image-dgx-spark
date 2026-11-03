@@ -1,0 +1,14 @@
+# qwen-image-comfyui 按需啟動 / 閒置關閉（見 comfy_ondemand.py）。
+# 使用者層級服務（funsteam 已開 linger，不需 sudo）：
+#   cp comfy-ondemand.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload && systemctl --user enable --now comfy-ondemand
+[Unit]
+Description=qwen-image-comfyui on-demand start / idle stop
+
+[Service]
+ExecStart=/usr/bin/python3 /home/funsteam/qwen-image/comfy_ondemand.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
