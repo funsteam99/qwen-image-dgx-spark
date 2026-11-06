@@ -114,7 +114,7 @@ def ensure_comfy():
 # HTTP 500，已於服務端更新補上）：
 #   8002  Qwen3.6-35B GGUF (llama.cpp)  文生圖改寫實測 8.2 秒，速度較快
 #   8006  qwen3.8-27B-NVFP4 (vLLM)      文生圖約 22~31 秒、改圖約 17.6 秒
-# 兩者速度/品質仍可能有差異，故不再自動路由，預設固定用 8002，由使用者視需要手動切換。
+# 兩者速度/品質仍可能有差異，故不再自動路由，預設固定用 8006（2026-11-06 起，原為 8002），由使用者視需要手動切換。
 LLM_ENDPOINTS = {
     "8002": {"host": os.environ.get("LLM_HOST_TEXT", "127.0.0.1:8002"),
              "model": os.environ.get("LLM_MODEL_TEXT",
@@ -134,7 +134,7 @@ PE_BACKENDS = {
     "8002 Qwen3.6 (具視覺, 最快)": "8002",
     "8006 qwen3.8 (具視覺, 較慢)": "8006",
 }
-DEFAULT_PE_BACKEND = "8002 Qwen3.6 (具視覺, 最快)"
+DEFAULT_PE_BACKEND = "8006 qwen3.8 (具視覺, 較慢)"
 
 
 def pick_endpoint(backend, task):
@@ -1739,7 +1739,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             if not imgs:
                 return gr.update(), gr.update(), "⚠️ 改圖模式需要至少一張圖片才能改寫。"
 
-        backend = PE_BACKENDS.get(backend_label, "8002")
+        backend = PE_BACKENDS.get(backend_label, "8006")
         endpoint = None
         if backend != "pe":
             _key, endpoint, warn = pick_endpoint(backend, task)
