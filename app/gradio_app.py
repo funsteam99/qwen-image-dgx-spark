@@ -169,11 +169,14 @@ def _read_system_prompt(task):
         return f.read()
 
 
-def call_llm(task, user_prompt, pil_images=None, endpoint=None, timeout=600):
+def call_llm(task, user_prompt, pil_images=None, endpoint=None, timeout=1200, thinking=False):
     """用本機 vLLM 服務改寫，套用官方 system prompt 與官方的解析規則。
 
-    enable_thinking 必須關閉：開啟時輸出常被 max_tokens 截斷在 thinking 階段，
-    回傳空的 content（實測 259 秒且完全無輸出）。
+    thinking 預設關（擴寫是轉換型任務；2026-11-06 實測開啟後 8002/8006 皆約 90~100 秒，
+    關閉時 8~30 秒），由 UI「深度思考」勾選開啟。早先開啟會被截斷在 thinking 階段、
+    content 為空，是 max_tokens 不夠；現在拉到 32768（兩端上下文 8002=98304、8006=131072）。
+    思考內容不在 content 裡：8002（llama.cpp --reasoning on）放 reasoning_content，
+    8006（vLLM）放 reasoning；若伺服器沒拆開，則從 content 去掉 <think>…</think>。
     """
     content = [{"type": "image_url",
                 "image_url": {"url": "data:image/png;base64," + pil_to_b64(im)}}
@@ -195,13 +198,13 @@ def call_llm(task, user_prompt, pil_images=None, endpoint=None, timeout=600):
         "model": endpoint["model"],
         "messages": [{"role": "system", "content": system_text},
                      {"role": "user", "content": content}],
-        "max_tokens": 8192,
+        "max_tokens": 32768,
         "temperature": 1.0,
         "top_p": 0.95,
         # 官方 pe_core profile：t2i 用 1.5、edit 用 0.0。
         # 漏掉此值時 8002 的輸出長度在 724~1479 字元間大幅浮動；補上後穩定於 1600 上下。
         "presence_penalty": 1.5 if task == "t2i" else 0.0,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": bool(thinking)},
     }
     req = urllib.request.Request(
         f"http://{endpoint['host']}/v1/chat/completions",
@@ -210,10 +213,21 @@ def call_llm(task, user_prompt, pil_images=None, endpoint=None, timeout=600):
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         data = json.loads(resp.read().decode("utf-8"))
-    text = (data["choices"][0]["message"].get("content") or "")
+    choice = data["choices"][0]
+    msg = choice["message"]
+    text = msg.get("content") or ""
+    thinking = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    if "<think>" in text or "</think>" in text:
+        import re
+        inline = re.findall(r"<think>(.*?)(?:</think>|$)", text, flags=re.S)
+        thinking = thinking or "".join(inline)
+        # 未閉合的 <think> 代表整段都是思考（被截斷），去掉後 content 為空
+        text = re.sub(r"<think>.*?(?:</think>|$)", "", text, flags=re.S)
+        text = text.split("</think>")[-1]
     parsed = _parse_pe_answer(text, task)
     parsed["elapsed"] = round(time.time() - t0, 1)
-    parsed["thinking_chars"] = 0
+    parsed["thinking_chars"] = len(thinking)
+    parsed["truncated"] = choice.get("finish_reason") == "length"
     return parsed
 
 
@@ -1479,6 +1493,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
                         label="改寫引擎",
                         scale=2
                     )
+                    pe_thinking = gr.Checkbox(value=False, label="深度思考（較慢）", scale=1)
                 pe_status = gr.Markdown("")
 
             with gr.Accordion("💡 官方 GitHub 標準提示詞範本 (一鍵填入)", open=False):
@@ -1714,7 +1729,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
         ).then(on_precision_change, inputs=precision, outputs=[steps, cfg], queue=False)
         # 範例寫死 40 步；選 Turbo 時再依精度覆寫回 8 步並鎖定。
 
-    def enhance_prompt(m, orig_text, editor_data, refs, sd, backend_label):
+    def enhance_prompt(m, orig_text, editor_data, refs, sd, backend_label, thinking=False):
         """官方 Prompt Enhancer：拿「原始提示詞」欄位當下的內容去改寫，
         每次按下都以該欄位為準，覆蓋上一次的擴寫結果；原始欄位本身永不被程式改動。
         """
@@ -1749,7 +1764,7 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             if backend == "pe":
                 r = call_pe(task, p_text, imgs, sd)
             else:
-                r = call_llm(task, p_text, imgs, endpoint=endpoint)
+                r = call_llm(task, p_text, imgs, endpoint=endpoint, thinking=bool(thinking))
         except urllib.error.HTTPError as e:
             try:
                 msg = json.loads(e.read().decode("utf-8")).get("error", str(e))
@@ -1780,17 +1795,20 @@ with gr.Blocks(title="Qwen-Image-2.1 官方標準工作站 (DGX Spark)", css=cus
             # 解析失敗時原始輸出可能混雜語言或殘留 JSON 片段，不可污染提示詞欄位，
             # 「擴寫後」欄位保持原樣不變，可疑輸出留在狀態列供排查。
             preview = new_prompt.replace("\n", " ")[:200]
-            flag = "⚠️ 未解析出 JSON，「擴寫後」欄位維持不變"
+            flag = ("⚠️ 輸出超過 max_tokens 被截斷，「擴寫後」欄位維持不變" if r.get("truncated")
+                    else "⚠️ 未解析出 JSON，「擴寫後」欄位維持不變")
             return gr.update(), ratio_update, (
                 f"{flag}｜{engine}（{task}，{r.get('elapsed')}s）{note}｜原始輸出：{preview}")
 
         # 每次擴寫成功都覆蓋「擴寫後」欄位（不動「原始提示詞」欄位）
         return new_prompt, ratio_update, (
-            f"✅ {engine} 改寫完成（{task}，{r.get('elapsed')}s）{note}")
+            f"✅ {engine} 改寫完成（{task}，{r.get('elapsed')}s"
+            + (f"，思考 {r['thinking_chars']} 字" if r.get("thinking_chars") else "")
+            + f"）{note}")
 
     btn_pe.click(
         fn=enhance_prompt,
-        inputs=[mode, orig_prompt_display, editor_input, ref_images_state, seed, pe_backend],
+        inputs=[mode, orig_prompt_display, editor_input, ref_images_state, seed, pe_backend, pe_thinking],
         outputs=[prompt, aspect_ratio, pe_status]
     )
 
